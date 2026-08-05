@@ -1,0 +1,26 @@
+# Local secrets and environment overrides.
+.env
+.env.*
+!.env.example
+.trae/
+
+# Python environments, caches, and test output.
+backend/.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Frontend dependencies, build output, and browser test output.
+frontend/node_modules/
+frontend/.next/
+frontend/test-results/
+frontend/playwright-report/
+*.tsbuildinfo
+
+# Local runtime logs.
+*.log

@@ -1,0 +1,102 @@
+[
+  {
+    "id": "feedback-01",
+    "task_type": "continue",
+    "input_ref": "fixture://feedback/feedback-01",
+    "request": {"run_scope": "scene", "request_type": "continue", "decision_target": "scene", "author_feedback": {"text": "请调整语气：林默更谨慎一些，少一些锋芒。"}},
+    "expected": {"outcome": "accepted", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "accept",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-02",
+    "task_type": "continue",
+    "input_ref": "fixture://feedback/feedback-02",
+    "request": {"run_scope": "scene", "request_type": "continue", "decision_target": "scene", "author_feedback": {"text": "把星门异动写得更隐晦，先不让读者确认那是星门。"}},
+    "expected": {"outcome": "accepted", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "accept",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-03",
+    "task_type": "rewrite",
+    "input_ref": "fixture://feedback/feedback-03",
+    "request": {"run_scope": "scene", "request_type": "rewrite", "decision_target": "scene", "author_feedback": {"text": "重写开头：从观星台值夜人的视角切入，先不直接描写异动本身。"}},
+    "expected": {"outcome": "accepted", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "accept",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-04",
+    "task_type": "rewrite",
+    "input_ref": "fixture://feedback/feedback-04",
+    "request": {"run_scope": "scene", "request_type": "rewrite", "decision_target": "scene", "author_feedback": {"text": "重写低语段落：删去直接说明，改用环境与感官细节暗示旧神苏醒。"}},
+    "expected": {"outcome": "accepted", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "accept",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-05",
+    "task_type": "review",
+    "input_ref": "fixture://feedback/feedback-05",
+    "request": {"run_scope": "scene", "request_type": "review", "decision_target": "scene", "author_feedback": {"text": "审校时核对第二章“夜”与“昼”的时间顺序是否自洽。"}},
+    "expected": {"outcome": "accepted", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "accept",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-06",
+    "task_type": "review",
+    "input_ref": "fixture://feedback/feedback-06",
+    "request": {"run_scope": "scene", "request_type": "review", "decision_target": "scene", "author_feedback": {"text": "取消本轮审校，稍后再发起。"}},
+    "expected": {"outcome": "cancelled", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "cancel",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-07",
+    "task_type": "canon",
+    "input_ref": "fixture://feedback/feedback-07",
+    "request": {"run_scope": "scene", "request_type": "review", "decision_target": "canon", "author_feedback": {"text": "把“林默发现星门异动”提取为候选事实。"}},
+    "expected": {"outcome": "accepted", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "accept",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-08",
+    "task_type": "canon",
+    "input_ref": "fixture://feedback/feedback-08",
+    "request": {"run_scope": "scene", "request_type": "review", "decision_target": "canon", "author_feedback": {"text": "取消本次候选提取。"}},
+    "expected": {"outcome": "cancelled", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "cancel",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-09",
+    "task_type": "canon",
+    "input_ref": "fixture://feedback/feedback-09",
+    "request": {"run_scope": "scene", "request_type": "review", "decision_target": "canon", "author_feedback": {"text": "候选事实缺少足够章节佐证，先搁置，等待后续章节确认。"}},
+    "expected": {"outcome": "blocked", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "defer",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  },
+  {
+    "id": "feedback-10",
+    "task_type": "canon",
+    "input_ref": "fixture://feedback/feedback-10",
+    "request": {"run_scope": "scene", "request_type": "review", "decision_target": "canon", "author_feedback": {"text": "正典条目与既有设定存在冲突，等待人工仲裁，暂无结论。"}},
+    "expected": {"outcome": "blocked", "final_status": "waiting_feedback", "accepted_revision_delta": 0, "event_types": ["run_queued", "run_waiting_feedback"], "candidate_assertions": [], "version_assertions": []},
+    "blocking_issue": null,
+    "final_decision": "none",
+    "regression_ref": "tests/acceptance/author-feedback-10"
+  }
+]

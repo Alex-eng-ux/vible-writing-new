@@ -1,0 +1,83 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: novel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d novel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - private
+    # No host port published: PostgreSQL is only reachable inside the private network.
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      APP_ENV: development
+      DEPLOYMENT_MODE: single_user_private
+      API_BIND_SCOPE: compose_private
+      INTERNAL_API_BASE_URL: http://api:8000
+      DATABASE_URL: postgresql+psycopg://app:app@db:5432/novel
+      ACTOR_ID: local-actor
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      AUDIT_RETENTION_DAYS: 30
+      CHECKPOINT_RETENTION_DAYS: 7
+      LANGSMITH_CAPTURE_CONTENT: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - private
+    # No host port published: API is only reachable via the frontend proxy.
+
+  worker:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.worker_main"]
+    environment:
+      APP_ENV: development
+      DEPLOYMENT_MODE: single_user_private
+      API_BIND_SCOPE: compose_private
+      INTERNAL_API_BASE_URL: http://api:8000
+      DATABASE_URL: postgresql+psycopg://app:app@db:5432/novel
+      ACTOR_ID: local-actor
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      AUDIT_RETENTION_DAYS: 30
+      CHECKPOINT_RETENTION_DAYS: 7
+      LANGSMITH_CAPTURE_CONTENT: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - private
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      INTERNAL_API_BASE_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - private
+
+volumes:
+  pgdata:
+
+networks:
+  private:
+    driver: bridge

@@ -1,0 +1,46 @@
+{
+  "fixture_version": "v1.0",
+  "project": {"name": "验收作品", "genre": "玄幻", "target_reader": "成年读者", "default_style": "简洁"},
+  "volumes": [
+    {"local_key": "v1", "name": "第一卷·星门", "goal": "引入星门设定", "mainline": "主线A", "time_range": "第1-3章"}
+  ],
+  "chapters": [
+    {"local_key": "c1", "volume_local_key": "v1", "title": "第一章·观星台", "pov": "林默", "chapter_intent": {"text": "林默在观星台发现星门异动"}},
+    {"local_key": "c2", "volume_local_key": "v1", "title": "第二章·旧神低语", "pov": "林默", "chapter_intent": {"text": "星门背后的低语暗示旧神苏醒"}},
+    {"local_key": "c3", "volume_local_key": "v1", "title": "第三章·守望者", "pov": "林默", "chapter_intent": {"text": "林默确认自己成为星门守护者"}}
+  ],
+  "scenes": [
+    {"local_key": "s1", "chapter_local_key": "c1", "title": "场景一·发现", "pov": "林默", "location": "观星台", "story_time": "第1章·夜", "goal": "发现星门异动", "scene_brief": {"goal": "林默在观星台发现星门异动"}},
+    {"local_key": "s2", "chapter_local_key": "c1", "title": "场景二·异象", "pov": "林默", "location": "观星台", "story_time": "第1章·深夜", "goal": "记录异象", "scene_brief": {"goal": "林默记录星门异象"}},
+    {"local_key": "s3", "chapter_local_key": "c2", "title": "场景一·低语", "pov": "林默", "location": "密室", "story_time": "第2章·夜", "goal": "听见低语", "scene_brief": {"goal": "林默听见星门低语"}},
+    {"local_key": "s4", "chapter_local_key": "c2", "title": "场景二·追查", "pov": "林默", "location": "藏书阁", "story_time": "第2章·昼", "goal": "追查低语来源", "scene_brief": {"goal": "林默追查低语来源"}},
+    {"local_key": "s5", "chapter_local_key": "c3", "title": "场景一·传承", "pov": "林默", "location": "观星台", "story_time": "第3章·晨", "goal": "接受传承", "scene_brief": {"goal": "林默接受星门传承"}},
+    {"local_key": "s6", "chapter_local_key": "c3", "title": "场景二·起誓", "pov": "林默", "location": "观星台", "story_time": "第3章·午", "goal": "立下誓言", "scene_brief": {"goal": "林默立下守护者誓言"}}
+  ],
+  "fake_model_cases": [
+    {
+      "id": "scene-draft",
+      "match": {"request_type": "new_chapter", "decision_target": "scene", "scene_local_key": "s1"},
+      "response": {"status": "ready", "text": "林默在观星台发现星门异动。", "candidate_facts": [{"candidate_type": "fact", "local_key": "fact-1", "claim": "林默发现星门异动"}]},
+      "expected": {"router_outcome": "feedback", "run_status": "waiting_feedback", "candidate_assertions": [], "revision_assertions": [], "event_assertions": ["run_queued", "run_waiting_feedback"]}
+    },
+    {
+      "id": "chapter-plan",
+      "match": {"request_type": "new_chapter", "decision_target": "plan", "scene_local_key": null},
+      "response": {"status": "ready", "text": "章节规划完成"},
+      "expected": {"router_outcome": "feedback", "run_status": "waiting_feedback", "candidate_assertions": [], "revision_assertions": [], "event_assertions": ["run_queued", "run_waiting_feedback"]}
+    },
+    {
+      "id": "scene-review",
+      "match": {"request_type": "review", "decision_target": "scene", "scene_local_key": "s1"},
+      "response": {"status": "ready", "text": "审校完成"},
+      "expected": {"router_outcome": "feedback", "run_status": "waiting_feedback", "candidate_assertions": [], "revision_assertions": [], "event_assertions": ["run_queued", "run_waiting_feedback"]}
+    },
+    {
+      "id": "scene-canon",
+      "match": {"request_type": "review", "decision_target": "canon", "scene_local_key": "s1"},
+      "response": {"status": "ready", "text": "候选提取完成"},
+      "expected": {"router_outcome": "feedback", "run_status": "waiting_feedback", "candidate_assertions": [], "revision_assertions": [], "event_assertions": ["run_queued", "run_waiting_feedback"]}
+    }
+  ]
+}
