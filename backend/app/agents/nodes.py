@@ -70,6 +70,9 @@ class AgentCallable:
             hook.before(self._agent_type, envelope)
         output = self._agent.run(envelope)
         self._registry.schema.validate(output)
+        # Planner 专属结果校验必须发生在路由前，避免不完整候选被误判为可继续执行。
+        for hook in self._registry.result_validators(self._agent_type):
+            hook.validate(self._agent_type, output, envelope)
         outcome = self._router.route(output, self._agent_type, self._agent_type)
         for hook in self._registry.lifecycle(self._agent_type):
             hook.after(self._agent_type, output, outcome)

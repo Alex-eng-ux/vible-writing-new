@@ -312,6 +312,19 @@ def accept_chapter_plan_revision(
         for path, value in (brief.get("field_provenance") or {}).items():
             if isinstance(value, dict) and value.get("status") in {"ai_suggested", "unresolved"}:
                 unresolved.append(f"scene_briefs[{index}].{path}")
+    assumptions = [
+        str(item).strip()
+        for item in (plan.unresolved_assumptions or [])
+        if str(item).strip()
+    ]
+    if assumptions:
+        # 未解决假设代表 Planner 明确声明的信息缺口；即使候选 JSON 看起来完整，
+        # 也必须等作者确认或明确排除后才能推进 accepted pointer。
+        raise AppError(
+            "PLAN_NOT_ACCEPTED",
+            "candidate contains unresolved assumptions",
+            details={"assumptions": assumptions},
+        )
     if unresolved:
         raise AppError(
             "PLAN_NOT_ACCEPTED",

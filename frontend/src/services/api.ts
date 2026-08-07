@@ -224,6 +224,18 @@ export const rollbackScene = (sceneId: string, targetRevisionId: string, key: st
 export const getChapterWorkflow = (chapterId: string) =>
   requestJson<ChapterWorkflowRead>(`/api/chapters/${chapterId}/workflow`);
 
+/** 回滚章节到显式目标版本；服务端会保留历史并创建新的 staged 记录。 */
+export const rollbackChapterRevision = (chapterId: string, targetRevisionId: string, key: string) =>
+  requestJson<ChapterRevision>(`/api/chapters/${chapterId}/rollback`, {
+    method: "POST",
+    body: { target_revision_id: targetRevisionId, author_decision: "author" },
+    idempotencyKey: key,
+  });
+
+/** 读取章节版本历史；workflow 读取已包含同一数据，独立接口用于回滚后的显式刷新。 */
+export const listChapterRevisions = (chapterId: string) =>
+  requestJson<ChapterRevision[]>(`/api/chapters/${chapterId}/revisions`);
+
 export type ChapterRunRequest = {
   run_scope: "chapter";
   request_type: "new_chapter" | "review";
@@ -277,6 +289,20 @@ export type RunDecisionBody = {
   expected_current_plan_revision_id?: string | null;
   expected_plan_version?: number | null;
   chapter_revision_id?: string;
+  /** 章节反馈/接受时用于 CAS 的 accepted 章节版本基线。 */
+  base_chapter_revision_id?: string | null;
+  /** Planner 问题/提案的结构化反馈；text 保留用于旧客户端兼容。 */
+  feedback?: {
+    text?: string;
+    kind?: "answer" | "feedback";
+    answers?: Array<{ question_id: string; text: string }>;
+    proposals?: Array<{
+      proposal_id: string;
+      action: "accept" | "modify" | "reject";
+      field_path?: string;
+      value?: unknown;
+    }>;
+  };
 };
 
 /** 作者决策：accept（接受）/ feedback（反馈或澄清回答）/ cancel（取消）。 */

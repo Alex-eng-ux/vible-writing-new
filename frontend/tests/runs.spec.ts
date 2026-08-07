@@ -372,6 +372,80 @@ test("场景处于运行中状态时不创建新的场景运行", async ({ page,
   expect(runRequests).toBe(0);
 });
 
+test("reopening a scene hydrates its active run and decision controls", async ({ page, request }) => {
+  const prefix = "run-hydration-" + Date.now();
+  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  seedPlan(chapterId, sceneId);
+
+  await page.route("**/api/chapters/*/workflow", async (route) => {
+    const { response, body } = await fetchWorkflowForRoute(route, request);
+    const workflow = body as {
+      active_run: Record<string, unknown> | null;
+      pending_decision: Record<string, unknown>;
+      scenes: Array<Record<string, unknown>>;
+      blocking_reasons: string[];
+    };
+    workflow.blocking_reasons = [];
+    workflow.active_run = {
+      run_id: "run-hydrated-scene",
+      thread_id: "run-hydrated-scene",
+      project_id: "project",
+      target_id: sceneId,
+      run_scope: "scene",
+      request_type: "review",
+      status: "waiting_feedback",
+      run_version: 4,
+      current_scene_id: sceneId,
+      current_node: "review",
+      pending_node: "review",
+      pause_reason: null,
+      clarification_questions: [],
+      last_error_code: null,
+      last_event_sequence: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      decision_target: "scene",
+    };
+    workflow.pending_decision = {
+      target: "scene",
+      kind: "answer_scene",
+      run_id: "run-hydrated-scene",
+      expected_run_version: 4,
+    };
+    workflow.scenes = [
+      {
+        scene_id: sceneId,
+        order: 0,
+        title: "场景",
+        status: "waiting_feedback",
+        accepted_revision_id: null,
+        current_run_id: "run-hydrated-scene",
+        blocking_reasons: [],
+      },
+    ];
+    await route.fulfill({
+      status: response.status(),
+      headers: response.headers(),
+      json: workflow,
+    });
+  });
+  await page.route("**/api/runs/*/events", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      headers: { "Cache-Control": "no-cache", Connection: "keep-alive" },
+      body: "",
+    });
+  });
+
+  await openScene(page, prefix + "-P", "场景");
+  await expect(page.getByTestId("run-panel")).toBeVisible();
+  await expect(page.getByTestId("run-status")).toContainText("等待反馈");
+  await expect(page.getByTestId("feedback-form")).toBeVisible();
+  await expect(page.getByTestId("btn-run-accept")).toBeVisible();
+  await expect(page.getByTestId("btn-run-cancel")).toBeVisible();
+});
+
 async function fullRunId(page: Page): Promise<string> {
   return (await page.getByTestId("run-id").getAttribute("data-full-run-id")) ?? "";
 }

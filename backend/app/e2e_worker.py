@@ -10,9 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import Final
+
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from .config import get_config
 from .db.session import get_session_factory
@@ -24,6 +28,38 @@ logger = logging.getLogger("novel-studio.e2e-worker")
 
 _DEFAULT_READY_HOST: Final[str] = "127.0.0.1"
 _DEFAULT_READY_PORT: Final[int] = 8001
+_SCHEMA_READY_TIMEOUT_SECONDS: Final[float] = 60.0
+_SCHEMA_READY_POLL_SECONDS: Final[float] = 0.25
+
+
+def _wait_for_database(
+    session_factory,
+    *,
+    timeout: float = _SCHEMA_READY_TIMEOUT_SECONDS,
+    interval: float = _SCHEMA_READY_POLL_SECONDS,
+) -> None:
+    """等待 E2E 数据库的运行时关键表可读，再启动 Worker 轮询线程。
+
+    globalSetup 会重建数据库，Playwright 随后并行启动 API 与 Worker；Worker 若先执行
+    首个 tick，会在表尚未建好时记录 ``UndefinedTable`` 并进入长轮询，导致就绪探针
+    虚假通过。这里探测 outbox 表作为 schema 完成标志，避免把短暂的建库竞态暴露给测试。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with session_factory() as session:
+                session.execute(text("SELECT 1 FROM run_outbox_records LIMIT 1"))
+            return
+        except SQLAlchemyError as exc:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("E2E database schema did not become ready") from exc
+            time.sleep(max(interval, 0.0))
+        except Exception as exc:
+            # Fake/test session factories may surface the same transient startup failure
+            # without SQLAlchemy wrapping it; keep the worker fail-closed in that case too.
+            if time.monotonic() >= deadline:
+                raise RuntimeError("E2E database schema did not become ready") from exc
+            time.sleep(max(interval, 0.0))
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -83,6 +119,7 @@ def main() -> None:
     cfg = get_config()
     wiring = make_wiring(cfg)
     provider = _build_provider(cfg, wiring)
+    _wait_for_database(get_session_factory())
     worker = RunWorker(
         get_session_factory(),
         actor_id=cfg.actor_id,

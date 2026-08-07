@@ -148,6 +148,53 @@ def test_run_create_same_key_different_request_reuse(client):
     assert resp.json()["code"] == "IDEMPOTENCY_KEY_REUSE"
 
 
+def test_chapter_feedback_rejects_stale_base_revision(client, db):
+    """章节反馈必须以当前 accepted 章节版本为基线，拒绝过期工作台提交。"""
+    project = _create_project(client)
+    volume = _create_volume(client, project["id"])
+    chapter = _create_chapter(client, volume["id"])
+    ctx = {"actor_id": "author", "idempotency_key": "chapter-feedback-base-1"}
+    plan = create_chapter_plan_revision(
+        db, chapter["id"], None, {"scenes": []}, "plan", ctx
+    )
+    accept_chapter_plan_revision(db, chapter["id"], plan.id, None, 1, ctx)
+    accepted = aggregate_chapter_revision(db, chapter["id"], [], "first", ctx)
+    commit_chapter_version(db, accepted.id, ctx)
+    db.commit()
+
+    run = _create_run(
+        client,
+        chapter["id"],
+        "chapter-feedback-run",
+        request_type="review",
+        decision_target="chapter",
+        plan_revision_id=plan.id,
+        base_chapter_revision_id=accepted.id,
+    )
+    db.get(GenerationRun, run["run_id"]).status = "waiting_feedback"
+    db.commit()
+
+    newer = aggregate_chapter_revision(db, chapter["id"], [], "second", ctx)
+    commit_chapter_version(db, newer.id, {**ctx, "idempotency_key": "chapter-feedback-base-2"})
+    db.commit()
+
+    response = client.post(
+        f"/api/runs/{run['run_id']}/decisions",
+        json={
+            "idempotency_key": "chapter-feedback-stale",
+            "expected_run_version": 1,
+            "target": "chapter",
+            "decision": "feedback",
+            "chapter_revision_id": accepted.id,
+            "base_chapter_revision_id": accepted.id,
+            "text": "please revise",
+        },
+        headers={"Idempotency-Key": "chapter-feedback-stale"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "CHAPTER_OUT_OF_SYNC"
+
+
 def test_decision_run_version_cas_conflict(client):
     """expected_run_version 不匹配时拒绝决策（RUN_STATE_CONFLICT），不写任何决策。"""
     project = _create_project(client)

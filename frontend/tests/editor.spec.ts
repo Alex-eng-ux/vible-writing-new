@@ -125,14 +125,40 @@ async function advanceRevision(
 }
 
 /** 在导航树中展开层级并点击场景，等待编辑器加载。 */
+/** 按显式目标父版本回滚场景，返回新生成的 staged 版本 id。*/
+async function rollbackRevision(
+  request: APIRequestContext,
+  sceneId: string,
+  targetRevId: string,
+  keyPrefix: string,
+): Promise<string> {
+  const rollback = await request.post("/api/scenes/" + sceneId + "/rollback", {
+    data: {
+      target_revision_id: targetRevId,
+      author_decision: "author",
+    },
+    headers: { "Idempotency-Key": await apiKey(keyPrefix + "-rb") },
+  });
+  if (!rollback.ok()) throw new Error("rollback failed: " + await rollback.text());
+  return ((await rollback.json()) as { id: string }).id;
+}
+
 async function openScene(page: Page, projectName: string, sceneTitle: string) {
   await page.goto("/");
   await expect(page.getByTestId("nav-pane")).toBeVisible();
   await page.locator(".tree-label", { hasText: projectName }).getByRole("button", { name: "展开" }).click();
   await expect(page.getByTestId("input-volume-name")).toBeVisible();
-  await page.locator(".tree-label", { hasText: "V" }).getByRole("button", { name: "展开" }).click();
+  await page
+    .locator(".tree-label")
+    .filter({ has: page.getByText("📖 V", { exact: true }) })
+    .getByRole("button", { name: "展开" })
+    .click();
   await expect(page.getByTestId("input-chapter-title")).toBeVisible();
-  await page.locator(".tree-label", { hasText: "章" }).getByRole("button", { name: "展开" }).click();
+  await page
+    .locator(".tree-label")
+    .filter({ has: page.getByText("📃 章", { exact: true }) })
+    .getByRole("button", { name: "展开" })
+    .click();
   await expect(page.getByTestId("input-scene-title")).toBeVisible();
   await page.locator(".scene-item", { hasText: sceneTitle }).click();
   await expect(page.getByTestId("editor-pane")).toContainText(`场景：${sceneTitle}`);
@@ -142,7 +168,9 @@ async function typeInEditor(page: Page, text: string) {
   const editor = page.locator(".tiptap");
   await expect(editor).toBeVisible();
   await editor.click();
-  await page.keyboard.type(text, { delay: 5 });
+  // 让编辑器接收逐字符输入事件，确保 ProseMirror 的 onUpdate 会落地到 localText。
+  await editor.pressSequentially(text, { delay: 5 });
+  await expect(editor).toContainText(text);
 }
 
 test("创建资源并通过 UI 编辑保存首稿", async ({ page }) => {
@@ -224,6 +252,8 @@ test("过期基线冲突展示并可覆盖提交", async ({ page, request }) => 
   // 先提交空首稿 -> rev1，使场景有 accepted 基线。
   await commitRootDraft(request, sceneId, `${prefix}-root`);
   await openScene(page, `${prefix}-P`, "场景");
+  // 等 accepted baseline 真正加载完成，避免初始化态把本地输入覆盖回服务端版本。
+  await expect(page.locator(".baseline-hint")).not.toContainText("空文档");
 
   // 本地编辑（未保存）
   await typeInEditor(page, "我的本地文本");
@@ -239,6 +269,7 @@ test("过期基线冲突展示并可覆盖提交", async ({ page, request }) => 
   await page.getByTestId("btn-save").click();
   await expect(page.getByTestId("conflict-panel")).toBeVisible();
   await expect(page.getByTestId("status-message")).toContainText("基线已过期");
+  await expect(page.locator(".tiptap")).toContainText("我的本地文本");
 
   // 覆盖提交：以我的文本基于最新版本提交
   await page.getByTestId("btn-conflict-override").click();
@@ -248,7 +279,7 @@ test("过期基线冲突展示并可覆盖提交", async ({ page, request }) => 
   await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(3);
 });
 
-test("手动回滚到目标版本", async ({ page, request }) => {
+test("手动回滚只生成 staged 记录并保留 accepted 基线", async ({ page, request }) => {
   const prefix = `t4-${Date.now()}`;
   const { sceneId } = await createHierarchy(request, prefix);
   await openScene(page, `${prefix}-P`, "场景");
@@ -273,10 +304,10 @@ test("手动回滚到目标版本", async ({ page, request }) => {
   await expect(page.getByTestId("status-message")).toContainText("已回滚到版本");
   // 回滚生成新血缘记录，历史不删除
   await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(3);
-  // 编辑器内容恢复为 rev1 的正文（版本一）
+  // 当前契约：rollback 不改变 accepted 指针，编辑器仍停留在 authoritative accepted 基线。
   const editorText = await page.locator(".tiptap").innerText();
-  expect(editorText).toContain("版本一");
-  await expect(editorText).not.toContain("版本二");
+  expect(editorText).toContain("版本二");
+  await expect(editorText).not.toContain("版本一");
 });
 
 test("所有命令请求都携带 Idempotency-Key", async ({ page }) => {
@@ -296,6 +327,95 @@ test("所有命令请求都携带 Idempotency-Key", async ({ page }) => {
   expect(missing, "POST /api/* 请求必须携带 Idempotency-Key").toEqual([]);
 });
 
+test("rollback follow-up save uses the authoritative accepted revision", async ({ page, request }) => {
+  const prefix = `rollback-baseline-${Date.now()}`;
+  const { sceneId } = await createHierarchy(request, prefix);
+  await openScene(page, `${prefix}-P`, "场景");
+
+  await typeInEditor(page, "revision one");
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(1);
+  const rev1Id = (await page.getByTestId("history-pane").locator(".revision-item").first().getAttribute("data-revision-id")) ?? "";
+
+  await page.locator(".tiptap").click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.type("revision two");
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(2);
+  const rev2Id =
+    (await page.getByTestId("history-pane").locator(".revision-item").first().getAttribute("data-revision-id")) ?? "";
+
+  await page.getByTestId(`btn-rollback-${rev1Id}`).click();
+  await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(3);
+
+  let followUpChangeSetBody: Record<string, unknown> | null = null;
+  page.on("request", (requestEvent) => {
+    if (requestEvent.method() === "POST" && requestEvent.url().endsWith(`/api/scenes/${sceneId}/changesets`)) {
+      followUpChangeSetBody = requestEvent.postDataJSON() as Record<string, unknown>;
+    }
+  });
+  await page.locator(".tiptap").click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.type("post rollback edit");
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(4);
+  expect(followUpChangeSetBody).toMatchObject({ base_scene_revision_id: rev2Id });
+});
+
+test("reload hydrates a scene active run into RunPanel", async ({ page, request }) => {
+  const prefix = `scene-active-reload-${Date.now()}`;
+  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  seedAcceptedPlan(chapterId);
+  await commitRootDraft(request, sceneId, `${prefix}-root`);
+
+  await page.route("**/api/chapters/*/workflow", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as {
+      blocking_reasons: string[];
+      active_run: Record<string, unknown> | null;
+      scenes: Array<Record<string, unknown>>;
+    };
+    body.blocking_reasons = [];
+    body.active_run = {
+      run_id: "run-active-scene-reload",
+      thread_id: "run-active-scene-reload",
+      project_id: "project-active-scene-reload",
+      target_id: sceneId,
+      run_scope: "scene",
+      request_type: "review",
+      status: "waiting_feedback",
+      run_version: 2,
+      current_scene_id: sceneId,
+      current_node: "review",
+      pending_node: "review",
+      pause_reason: null,
+      clarification_questions: [],
+      last_error_code: null,
+      last_event_sequence: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      decision_target: "scene",
+    };
+    body.scenes = [{
+      scene_id: sceneId,
+      order: 0,
+      title: "场景",
+      status: "waiting_feedback",
+      accepted_revision_id: body.scenes[0]?.accepted_revision_id ?? null,
+      current_run_id: "run-active-scene-reload",
+      blocking_reasons: [],
+    }];
+    await route.fulfill({ response, json: body });
+  });
+
+  await openScene(page, `${prefix}-P`, "场景");
+  await expect(page.getByTestId("run-panel")).toBeVisible();
+  await expect(page.getByTestId("run-id")).toHaveAttribute("data-full-run-id", "run-active-scene-reload");
+  await expect(page.getByTestId("btn-run-accept")).toBeVisible();
+});
+
 test("context menu deletes a project after confirmation", async ({ page, request }) => {
   const prefix = `delete-${Date.now()}`;
   await createHierarchy(request, prefix);
@@ -307,6 +427,51 @@ test("context menu deletes a project after confirmation", async ({ page, request
   page.once("dialog", (dialog) => void dialog.accept());
   await page.getByRole("menuitem", { name: "删除" }).click();
   await expect(project).not.toBeVisible();
+});
+
+test("rollback 后仍按 workflow accepted 指针渲染基线并保存", async ({ page, request }) => {
+  const prefix = "rollback-baseline-" + Date.now();
+  const { sceneId } = await createHierarchy(request, prefix);
+  await openScene(page, prefix + "-P", "场景");
+
+  const changeSetBodies: Array<Record<string, unknown>> = [];
+  page.on("request", (req) => {
+    if (req.method() === "POST" && req.url().endsWith("/api/scenes/" + sceneId + "/changesets")) {
+      changeSetBodies.push(req.postDataJSON() as Record<string, unknown>);
+    }
+  });
+
+  await typeInEditor(page, "第一版本");
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(1);
+  const rev1Id =
+    (await page.getByTestId("history-pane").locator(".revision-item").first().getAttribute("data-revision-id")) ??
+    "";
+
+  await page.locator(".tiptap").click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.type("第二版本", { delay: 5 });
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("history-pane").locator(".revision-item")).toHaveCount(2);
+  const rev2Id =
+    (await page.getByTestId("history-pane").locator(".revision-item").first().getAttribute("data-revision-id")) ??
+    "";
+
+  await rollbackRevision(request, sceneId, rev1Id, prefix);
+  await openScene(page, prefix + "-P", "场景");
+
+  await expect(page.locator(".baseline-hint")).toContainText(rev2Id.slice(0, 8));
+  await expect(page.locator(".tiptap")).toContainText("第二版本");
+  await expect(page.locator(".tiptap")).not.toContainText("第一版本");
+  await expect(page.getByTestId("history-pane").locator(".revision-badge").first()).toHaveText("staged");
+
+  await page.locator(".tiptap").click();
+  await page.keyboard.type("连续修改", { delay: 5 });
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("status-message")).toContainText("已保存并提交版本");
+  expect(changeSetBodies).toHaveLength(3);
+  expect(changeSetBodies[2].base_scene_revision_id).toBe(rev2Id);
 });
 
 test("scene workspace loads plan state from workflow and keeps the editor usable", async ({

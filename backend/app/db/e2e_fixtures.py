@@ -42,15 +42,15 @@ from app.db.models import (
     ChapterRevision,
     FactCandidate,
     GenerationRun,
-    PlotThreadUpdate,
     PlotThread,
+    PlotThreadUpdate,
     RunEvent,
     RunOutboxRecord,
     Scene,
     SceneDraftArtifact,
     SceneRevision,
-    TimelineEventCandidate,
     TimelineEvent,
+    TimelineEventCandidate,
 )
 from app.domain.chapters import (
     accept_chapter_plan_revision,
@@ -340,7 +340,7 @@ def seed_canon_candidates(session: Session, run_id: str) -> str:
                 "source_revision_id": source_rev,
             }
         )
-    existing_rows = []
+    existing_rows: list[Any] = []
     for model in (FactCandidate, TimelineEventCandidate, PlotThreadUpdate):
         existing_rows.extend(
             session.execute(

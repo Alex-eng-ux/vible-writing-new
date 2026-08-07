@@ -97,8 +97,12 @@ export type ChapterRevision = {
   parent_revision_id: string | null;
   chapter_id: string;
   status: string;
-  reason: string;
+  reason: string | null;
   created_at: string;
+  scene_versions?: Array<{ scene_id: string; scene_revision_id: string; sort_order: number }>;
+  review_issues?: ReviewIssueItem[];
+  review_summary?: Record<string, unknown>;
+  is_current_accepted?: boolean;
 };
 
 /** 后端最小 prosemirror_step 文档级操作（与 domain/prosemirror.py 一致）。 */

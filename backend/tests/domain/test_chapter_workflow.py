@@ -104,6 +104,30 @@ def test_accept_plan_first_round_allows_null_pointer_and_rejects_stale_replay(db
         accept_chapter_plan_revision(db, chapter.id, plan.id, plan.id, 2, _ctx())
 
 
+def test_accept_plan_rejects_unresolved_assumptions(db, volume):
+    """未解决的 Planner 假设不能绕过作者确认进入 accepted plan。"""
+    chapter = create_chapter(db, volume, "C", "pov", {"text": "intent"}, _ctx())
+    plan = persist_chapter_plan_candidate(
+        db,
+        chapter.id,
+        source_run_id="run-unresolved-assumption",
+        planning_lineage_id="lineage-unresolved-assumption",
+        chapter_contract={"pov": "pov"},
+        scene_briefs=[{"client_key": "s1", "title": "S1", "scene_brief": {}}],
+        reason="candidate",
+        unresolved_assumptions=["主角的动机尚未确认"],
+        ctx=_ctx(),
+    )
+
+    with pytest.raises(AppError) as exc:
+        accept_chapter_plan_revision(db, chapter.id, plan.id, None, 1, _ctx())
+
+    assert exc.value.code == "PLAN_NOT_ACCEPTED"
+    assert exc.value.details == {"assumptions": ["主角的动机尚未确认"]}
+    assert plan.status == "pending"
+    assert db.query(ChapterPlanRevisionLink).filter_by(chapter_id=chapter.id).count() == 0
+
+
 def test_planner_output_replay_deduplicates_question_proposal_and_message(db, volume):
     chapter = create_chapter(db, volume, "C", "pov", {"text": "intent"}, _ctx())
     project_id = db.get(Volume, volume).project_id

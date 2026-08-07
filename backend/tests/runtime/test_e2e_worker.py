@@ -4,7 +4,9 @@ import json
 from threading import Thread
 from urllib.request import urlopen
 
-from app.e2e_worker import create_ready_server
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.e2e_worker import _wait_for_database, create_ready_server
 
 
 def test_e2e_worker_ready_probe_is_independent_from_api() -> None:
@@ -21,3 +23,24 @@ def test_e2e_worker_ready_probe_is_independent_from_api() -> None:
     finally:
         server.shutdown()
         thread.join(timeout=2)
+
+
+def test_e2e_worker_waits_for_required_schema_before_starting() -> None:
+    """Worker 就绪前必须确认关键表已创建，避免 bootstrap 与首个 tick 竞态。"""
+    attempts = 0
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, _statement):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise SQLAlchemyError("undefined table: run_outbox_records")
+
+    _wait_for_database(lambda: Session(), timeout=0.2, interval=0)
+    assert attempts == 2

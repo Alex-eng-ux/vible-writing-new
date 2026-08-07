@@ -2,7 +2,7 @@
 
 ## 工作性质与范围
 
-本次继续执行章节工作台 v2 计划，处理终审报告中的三个 Important 问题，并补齐全量后端回归中暴露的测试夹具契约。随后继续修复 `runs.spec.ts` 的 Playwright 路由收尾竞态。范围覆盖场景工作台读取源、Canon 候选来源绑定、Story Bible 运行状态、旧编辑器 Playwright 用例、E2E Worker 配置、场景运行 fixture 和相关后端测试。
+本次继续执行章节工作台 v2 计划，完成终审报告中的重要问题修复，并继续处理真实 Playwright 重跑暴露的 Worker 启动竞态、章节决策基线校验和前端回滚回归。范围覆盖章节意图持久化、计划接受前场景阻断、按 accepted revision 绑定 Canon、Canon fixture 幂等、诊断 outbox 状态、Story Bible 稳定导航定位、Worker schema 就绪门禁、章节 `base_chapter_revision_id` CAS，以及前端编辑器/运行恢复/回滚测试。
 
 ## 用户主导决策
 
@@ -12,6 +12,9 @@
 | Canon 候选按 accepted revision 和当前 run 绑定 | 避免自动运行尚无候选时状态消失，以及历史候选串到新来源 | 候选列表返回 `source_revision_id`、`run_id`、`run_status`，只返回当前来源最新 run 的候选 |
 | 继续用 TDD 和子 agent 验收 | 用户明确要求任务分发、回报、循环验收 | Task 7 由修复 agent 完成，终审 agent 复审；本轮先补回归测试再改生产代码 | 
 | 测试路由必须在页面销毁前清理 | 真实提升权限重跑仍复现后台 workflow 回调的 `Response/request context disposed`，根因是测试收尾时路由仍在途 | `runs.spec.ts` 增加 `test.afterEach` 调用 `page.unrouteAll({ behavior: "ignoreErrors" })`，只处理测试 mock 的收尾竞态 |
+| 浏览器验证必须取得真实进程证据 | 普通沙箱曾返回 `spawn EPERM`，不能把进程启动失败冒充行为 RED/GREEN | 使用提升权限环境实际启动 API、Worker、Next.js 和 Chromium；章节旅程 3/3、Story Bible 4/4、全量 25/25 通过 |
+| E2E 导航必须使用稳定资源身份 | Story Bible 旧 helper 用 `hasText: "V"`，在历史项目名包含相同文本时触发 strict mode | `openScene` 改为传递 project/volume/chapter/scene ID，并使用既有 `data-testid`，业务断言保持不变 |
+| 回滚后的后续保存继续使用权威 accepted 基线 | 用户要求计划执行到落地，且回归测试需要验证版本血缘不被 staged 回滚覆盖 | 回滚只创建 staged 记录；workflow 的 accepted 指针保持原 accepted revision，后续 change set 必须以该指针为 `base_scene_revision_id` |
 
 ## 关键规则与取舍
 
@@ -30,25 +33,36 @@
 - 修正全量回归中两个旧测试 helper 的输入契约。
 - 新增交接材料：`codex-handoff/2026-08-07-chapter-workbench-task8-brief.md`。
 - 修复 `runs.spec.ts` 中 4 处已消费 `APIResponse` 的 route mock，统一显式回填状态、响应头和 JSON；增加测试结束时的路由清理，并更新 `codex-handoff/2026-08-07-runs-route-fix-report.md`。
+- Task 10 第二轮修复：`new_chapter` 意图持久化并由 workflow 回读；计划接受前不生成场景，后续场景 blocker 不再全局阻断首场景；章节审校和 Canon 主旅程改为 UI 启动并验证来源、作用域和状态。
+- E2E fixture 改为按 run identity get-or-create；Canon 重复播种不重复 fencing/event；`diagnose` 排除已消费 outbox；`source_revision_id` 按实际 API 顶层契约断言。
+- Task 11 清零 `mypy app` 的 22 个类型错误，并补齐 fixture 局部类型标注；未使用 `# type: ignore`，未删除测试。
+- Task 12 修复 Story Bible Playwright 模糊导航定位器，新增稳定 ID 传递；真实 RED 复现后修复，未改业务代码。
+- 新增验收材料：`codex-handoff/2026-08-07-chapter-workbench-task10-rereview-2.md`、`codex-handoff/2026-08-07-chapter-workbench-task12-report.md`。
+- 新增 `codex-handoff/2026-08-07-frontend-test-encoding-repair.md`：修复 editor/runs 新增 Playwright 用例中的 UTF-8 乱码，真实场景活动运行重载和恢复用例通过。
+- 新增 `codex-handoff/2026-08-07-backend-migration-race-report.md`：E2E Worker 在 schema 可读前不启动轮询、不开放 ready；章节 accept/feedback 消费并校验 `base_chapter_revision_id`，过期基线返回 `CHAPTER_OUT_OF_SYNC`。
+- 新增后端回归测试覆盖 schema 就绪门禁和章节过期基线，前端回滚测试改为断言 accepted 指针而非 staged 回滚记录。
+- 新增 `codex-handoff/2026-08-07-conflict-save-fix.md`：冲突刷新时保留作者本地草稿，accepted 基线从 revisions 中取最后一条 accepted，覆盖提交和回滚后继续保存回归通过。
 
 ## 验证结果
 
-- 后端全量 `pytest -q`：通过，跳过项为环境/可选 smoke 测试。
+- 后端全量 `pytest -q`：退出码 0，跳过项为环境/可选 smoke 测试。
 - 后端全量 Ruff：通过。
+- 后端 `mypy app`：`Success: no issues found in 111 source files`。
+- 后端 `compileall -q app`：通过。
 - 前端 `npm run typecheck`：通过。
-- Playwright 测试文件 `--list`：列出 11 个测试；实际浏览器执行被环境 `Error: spawn EPERM` 阻断。
-- 提升权限后 `frontend/tests/runs.spec.ts` 完整执行：`11 passed`；目标 workflow 刷新用例单独执行：`1 passed`。
-- Next.js `npm run build`：被同一 `spawn EPERM` 阻断。
+- 提升权限后全量 Playwright：`31 passed`，覆盖章节工作流、编辑器冲突/回滚、运行恢复、Planner/Chapter feedback、Story Bible 与 Canon 旅程。
+- 提升权限后 `npm run build`：通过，Next.js 完成静态页生成和生产构建。
 - `git diff --check`：通过。
 - 旧 `createChapterPlan`、`handleCreateChapterPlan`、`post_chapter_plan` 符号搜索无结果。
+- 后端聚焦回归：45 tests passed；Ruff、`mypy app`、`compileall` 和 `git diff --check` 通过。
+- 前端新增回归：`editor` 场景活动运行重载通过，`runs` 活动运行恢复通过；回滚后续保存已确认使用原 accepted revision 作为基线。
 
 ## 当前不足与风险
 
 | 问题 | 影响 | 验证状态 |
 | --- | --- | --- |
-| 普通沙箱仍禁止 Playwright/Next 启动子进程 | 常规权限下无法取得浏览器旅程和生产构建证据 | 已复现 `spawn EPERM`；提升权限后 runs 套件已取得真实证据 |
-| 浏览器级章节全旅程和其他回归文件尚未在本轮重跑 | 不能把 `runs.spec.ts` 通过等同于全部前端旅程通过 | `runs.spec.ts` 已通过；`chapter-workflow.spec.ts`、`editor.spec.ts`、`story-bible.spec.ts` 仍待同一环境执行 |
+| Playwright 的 `reuseExistingServer` 与 E2E globalSetup 可能在启动窗口发生服务生命周期竞态 | Worker 启动日志中仍观察到一次数据库 schema 尚未创建时的 `run_outbox_records` 查询错误；本次未影响 ready 门禁或测试结果，但会污染启动日志 | Worker 已在 schema 可读前阻止轮询并 fail-closed；本轮提升权限全量 Playwright `31 passed`，未出现用例失败；后续可将服务启动与数据库重置进一步串行化 |
 
 ## 当前未完成事项与下一步
 
-文档、后端实现、前端类型检查、全量后端回归和 `runs.spec.ts` 已完成验证。下一步在允许启动子进程的环境执行剩余 Playwright 文件和 Next.js 构建，然后进行全分支 changed-surface 复审；若出现失败，按 TDD 逐项复现、修复并更新本日志。
+章节工作台 v2 阶段 0-4、Task 10/11/12 已完成；本轮后端 Worker/章节 CAS 修复和前端冲突保存、回滚回归已实现并通过最终门禁。必选未完成事项：无。后续仅保留启动竞态的基础设施优化，不阻断当前功能落地。

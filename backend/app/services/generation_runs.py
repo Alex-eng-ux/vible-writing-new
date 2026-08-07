@@ -33,6 +33,7 @@ from ..db.models import (
     ChapterPlanRevision,
     ChapterPlanRevisionLink,
     ChapterPlanSceneLink,
+    ChapterRevision,
     GenerationRun,
     Scene,
     Volume,
@@ -710,6 +711,27 @@ def _apply_accept_action(
         return
 
 
+def _validate_chapter_decision_baseline(
+    session: Session, run: GenerationRun, body: DecisionRequest
+) -> None:
+    """校验章节接受/反馈使用的章节版本基线，避免工作台覆盖更新后的 accepted 指针。"""
+    if run.chapter_id is None:
+        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter decision requires a chapter run")
+    chapter = session.get(Chapter, run.chapter_id)
+    if chapter is None:
+        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter does not exist")
+    # 旧客户端的首版接受尚未发送该字段；新工作台一旦提供基线，就必须严格匹配。
+    if (
+        body.base_chapter_revision_id is not None
+        and body.base_chapter_revision_id != chapter.accepted_chapter_revision_id
+    ):
+        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter baseline is out of sync")
+    if body.chapter_revision_id is not None:
+        revision = session.get(ChapterRevision, body.chapter_revision_id)
+        if revision is None or revision.chapter_id != run.chapter_id:
+            raise AppError("CHAPTER_OUT_OF_SYNC", "chapter revision does not belong to this run")
+
+
 def submit_run_decision(
     session: Session,
     actor_id: str,
@@ -752,6 +774,8 @@ def submit_run_decision(
     if body.target == "scene":
         _validate_current_accepted_plan_for_run(session, run)
         _validate_scene_queue_position(session, run)
+    if body.target == "chapter" and body.decision in ("accept", "feedback"):
+        _validate_chapter_decision_baseline(session, run, body)
     # 决策类型各自定义允许状态：
     # - accept/feedback 只能在匹配的等待状态执行（waiting_feedback 二者均可；
     #   pending_clarification 仅 feedback）；queued/running 不得直接 accept。

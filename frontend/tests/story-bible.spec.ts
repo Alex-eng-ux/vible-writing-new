@@ -96,16 +96,23 @@ function seedCanonEntries(projectId: string, chapterId?: string): void {
 }
 
 /** 在导航树中展开层级并点击场景，等待编辑器加载。 */
-async function openScene(page: Page, projectName: string, sceneTitle: string) {
+async function openScene(
+  page: Page,
+  projectId: string,
+  volumeId: string,
+  chapterId: string,
+  sceneId: string,
+  sceneTitle: string,
+) {
   await page.goto("/");
   await expect(page.getByTestId("nav-pane")).toBeVisible();
-  await page.locator(".tree-label", { hasText: projectName }).getByRole("button", { name: "展开" }).click();
+  await page.getByTestId(`project-toggle-${projectId}`).click();
   await expect(page.getByTestId("input-volume-name")).toBeVisible();
-  await page.locator(".tree-label", { hasText: "V" }).getByRole("button", { name: "展开" }).click();
+  await page.getByTestId(`volume-toggle-${volumeId}`).click();
   await expect(page.getByTestId("input-chapter-title")).toBeVisible();
-  await page.locator(".tree-label", { hasText: "章" }).getByRole("button", { name: "展开" }).click();
+  await page.getByTestId(`chapter-item-${chapterId}`).locator("..").getByRole("button", { name: "展开" }).click();
   await expect(page.getByTestId("input-scene-title")).toBeVisible();
-  await page.locator(".scene-item", { hasText: sceneTitle }).click();
+  await page.getByTestId(`scene-item-${sceneId}`).click();
   await expect(page.getByTestId("editor-pane")).toContainText(`场景：${sceneTitle}`);
 }
 
@@ -146,13 +153,13 @@ async function waitForCanonRun(
 
 test("Story Bible 展示正式 Canon 与三类候选（来源/作用域/状态）", async ({ page, request }) => {
   const prefix = `sb1-${Date.now()}`;
-  const { projectId, chapterId, sceneId } = await createHierarchy(request, prefix);
+  const { projectId, volumeId, chapterId, sceneId } = await createHierarchy(request, prefix);
   seedPlan(chapterId);
   seedSceneAccepted(sceneId, "第一章开篇。");
   seedChapterAccepted(chapterId);
   seedCanonEntries(projectId, chapterId);
 
-  await openScene(page, `${prefix}-P`, "场景");
+  await openScene(page, projectId, volumeId, chapterId, sceneId, "场景");
   const panel = page.getByTestId("story-bible-panel");
   await expect(panel).toBeVisible();
 
@@ -192,12 +199,12 @@ test("Story Bible 展示正式 Canon 与三类候选（来源/作用域/状态�
 
 test("场景级确认只更新候选状态，不显示为全局 Canon 更新", async ({ page, request }) => {
   const prefix = `sb2-${Date.now()}`;
-  const { projectId, chapterId, sceneId } = await createHierarchy(request, prefix);
+  const { projectId, volumeId, chapterId, sceneId } = await createHierarchy(request, prefix);
   seedPlan(chapterId);
   seedSceneAccepted(sceneId, "第一章开篇。");
   seedCanonEntries(projectId);
 
-  await openScene(page, `${prefix}-P`, "场景");
+  await openScene(page, projectId, volumeId, chapterId, sceneId, "场景");
   await expect(page.getByTestId("canon-official").locator(".canon-entry-item")).toHaveCount(3);
 
   const runId = await startCanonExtract(page);
@@ -221,12 +228,12 @@ test("场景级确认只更新候选状态，不显示为全局 Canon 更新", a
 
 test("章节级决策更新全局 Canon（confirm 物化，reject/defer 不物化）", async ({ page, request }) => {
   const prefix = `sb3-${Date.now()}`;
-  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  const { projectId, volumeId, chapterId, sceneId } = await createHierarchy(request, prefix);
   seedPlan(chapterId);
   seedSceneAccepted(sceneId, "第一章开篇。");
   seedChapterAccepted(chapterId);
 
-  await openScene(page, `${prefix}-P`, "场景");
+  await openScene(page, projectId, volumeId, chapterId, sceneId, "场景");
   // 切换到章节级目标。
   await page.getByTestId("btn-canon-scope-chapter").click();
   // 章节接受事件会由 Worker 自动创建 Canon run；这里不重复点击提取入口。
@@ -261,11 +268,11 @@ test("章节级决策更新全局 Canon（confirm 物化，reject/defer 不物�
 
 test("Canon 决策请求携带并在失败重试时复用 Idempotency-Key", async ({ page, request }) => {
   const prefix = `sb4-${Date.now()}`;
-  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  const { projectId, volumeId, chapterId, sceneId } = await createHierarchy(request, prefix);
   seedPlan(chapterId);
   seedSceneAccepted(sceneId, "第一章开篇。");
 
-  await openScene(page, `${prefix}-P`, "场景");
+  await openScene(page, projectId, volumeId, chapterId, sceneId, "场景");
   const runId = await startCanonExtract(page);
   seedCanonCandidates(runId);
   await page.getByTestId("btn-canon-refresh").click();

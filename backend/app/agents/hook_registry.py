@@ -12,6 +12,8 @@ from app.agents.hooks import (
     ErrorHook,
     FactExtractionHook,
     LifecycleHook,
+    PlannerDiscussionHook,
+    ResultValidationHook,
     SchemaHook,
 )
 
@@ -24,6 +26,9 @@ class HookRegistry:
 
     def __init__(self) -> None:
         self._lifecycle: dict[str, list[LifecycleHook]] = {}
+        self._result_validators: dict[str, list[ResultValidationHook]] = {
+            "chapter_planner": [PlannerDiscussionHook()]
+        }
         self._schema = SchemaHook()
         self._error = ErrorHook()
         self._fact = FactExtractionHook()
@@ -47,6 +52,14 @@ class HookRegistry:
         返回：该类型注册的钩子列表；未注册时返回空列表。
         """
         return list(self._lifecycle.get(agent_type, []))
+
+    def register_result_validator(self, agent_type: str, hook: ResultValidationHook) -> None:
+        """注册路由前结果校验器；仅影响指定 Agent 类型。"""
+        self._result_validators.setdefault(agent_type, []).append(hook)
+
+    def result_validators(self, agent_type: str) -> list[ResultValidationHook]:
+        """返回指定 Agent 的路由前结果校验器副本。"""
+        return list(self._result_validators.get(agent_type, []))
 
     def set_commit_guard(self, hook: CommitGuardHook) -> None:
         """设置公共提交守卫钩子。
