@@ -71,6 +71,15 @@ _EVENT_QUEUED = "run_queued"
 _EVENT_ACCEPTED = "run_accepted"
 _EVENT_CANCELLED = "run_cancelled"
 
+# 这些状态仍可能继续产生候选；同一章节 accepted 修订的手动/自动请求必须复用它。
+_ACTIVE_CANON_RUN_STATUSES = {
+    "queued",
+    "running",
+    "waiting_feedback",
+    "pending_clarification",
+    "paused",
+}
+
 
 def _validate_candidate_content(session: Session, decisions: list[dict]) -> None:
     """按候选类型严格校验候选内容（来源段落引用/故事内有效时间/叙事认识状态）。
@@ -305,6 +314,26 @@ def start_canon_run(
         chapter_id = chapter.id
         scene_id = scene.id
         source_rev = body.accepted_scene_revision_id
+
+    if run_scope == "chapter":
+        # 与 accepted outbox 消费者共享事务锁，避免手动入口和自动入口并发时
+        # 在“查询后插入”之间产生两个相同来源的 Canon 运行。
+        lock_key = f"canon-auto:{chapter_id}:{source_rev}"
+        session.execute(
+            text("SELECT pg_advisory_xact_lock((:lock_id)::bigint)"),
+            {"lock_id": _advisory_lock_id(lock_key)},
+        )
+        existing = session.execute(
+            select(GenerationRun).where(
+                GenerationRun.chapter_id == chapter_id,
+                GenerationRun.scene_id.is_(None),
+                GenerationRun.decision_target == "canon",
+                GenerationRun.canon_source_revision_id == source_rev,
+                GenerationRun.status.in_(_ACTIVE_CANON_RUN_STATUSES),
+            )
+        ).scalars().first()
+        if existing is not None:
+            return run_snapshot(session, existing.id)
 
     run_id = str(uuid.uuid4())
     run = GenerationRun(

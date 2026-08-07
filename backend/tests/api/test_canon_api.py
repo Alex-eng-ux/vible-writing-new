@@ -149,6 +149,41 @@ def _project_id(db, chapter_id):
     return db.get(Volume, chapter.volume_id).project_id
 
 
+def _add_fact_candidate(
+    db,
+    chapter_id: str,
+    source_revision_id: str,
+    run_id: str,
+    fingerprint: str,
+    *,
+    scene_id: str | None = None,
+) -> FactCandidate:
+    """写入测试候选，显式指定来源修订和 Canon 运行以覆盖 API 绑定规则。"""
+    row = FactCandidate(
+        project_id=_project_id(db, chapter_id),
+        chapter_id=chapter_id,
+        scene_id=scene_id,
+        scope="scene" if scene_id else "chapter",
+        scope_identity=scene_id or chapter_id,
+        candidate_type="fact",
+        candidate_fingerprint=fingerprint,
+        status="pending",
+        source_revision_id=source_revision_id,
+        source_identity=f"source-{fingerprint[:8]}",
+        content={
+            "claim": "claim",
+            "paragraph_ref": "p1",
+            "effective_story_time": {"value": "第1章"},
+            "narrative_knowledge": "objective",
+        },
+        local_key=f"local-{fingerprint[:8]}",
+        generation_run_id=run_id,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
 def _make_canon_run(client, chapter_id, rev_id, key):
     resp = client.post(
         f"/api/chapters/{chapter_id}/canon-runs",
@@ -212,6 +247,96 @@ def test_chapter_and_scene_canon_run_endpoints(client, db):
     srow = db.get(GenerationRun, scene_run["run_id"])
     assert srow.decision_target == "canon"
     assert srow.canon_source_revision_id == srev_id
+
+
+def test_manual_chapter_canon_run_reuses_active_auto_run_for_same_revision(client, db):
+    """手动提取与章节接受事件必须复用同一来源版本的活动 Canon 运行。"""
+    project = _create_project(client)
+    volume = _create_volume(client, project["id"])
+    chapter, rev_id = _setup_chapter(db, client, volume["id"])
+
+    handle_chapter_accepted_outbox(
+        db,
+        {
+            "event_type": "chapter_revision.accepted",
+            "chapter_id": chapter["id"],
+            "accepted_chapter_revision_id": rev_id,
+        },
+    )
+    db.commit()
+    auto_run = db.execute(
+        select(GenerationRun).where(
+            GenerationRun.chapter_id == chapter["id"],
+            GenerationRun.decision_target == "canon",
+            GenerationRun.canon_source_revision_id == rev_id,
+        )
+    ).scalar_one()
+    assert auto_run.status == "queued"
+
+    manual_response = client.post(
+        f"/api/chapters/{chapter['id']}/canon-runs",
+        json={"canon_scope": "chapter", "accepted_chapter_revision_id": rev_id},
+        headers={"Idempotency-Key": "manual-same-source"},
+    )
+
+    assert manual_response.status_code == 200, manual_response.text
+    assert manual_response.json()["run_id"] == auto_run.id
+    runs = db.execute(
+        select(GenerationRun).where(
+            GenerationRun.chapter_id == chapter["id"],
+            GenerationRun.decision_target == "canon",
+            GenerationRun.canon_source_revision_id == rev_id,
+        )
+    ).scalars().all()
+    assert len(runs) == 1
+
+
+def test_canon_candidate_list_binds_current_revision_and_latest_run(client, db):
+    """候选读取只返回当前 accepted 来源及其最新 Canon run。"""
+    project = _create_project(client)
+    volume = _create_volume(client, project["id"])
+    chapter, rev_id = _setup_chapter(db, client, volume["id"])
+    old_run = _make_canon_run(client, chapter["id"], rev_id, "canon-list-old")
+    db.get(GenerationRun, old_run["run_id"]).status = "accepted"
+    db.commit()
+    run = _make_canon_run(client, chapter["id"], rev_id, "canon-list-current")
+    current = _add_fact_candidate(db, chapter["id"], rev_id, run["run_id"], "a" * 64)
+    historical = _add_fact_candidate(
+        db, chapter["id"], rev_id, old_run["run_id"], "b" * 64
+    )
+    legacy_source = _add_fact_candidate(
+        db, chapter["id"], "historical-revision", old_run["run_id"], "c" * 64
+    )
+    db.commit()
+
+    response = client.get(f"/api/chapters/{chapter['id']}/canon-candidates")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["source_revision_id"] == rev_id
+    assert payload["run_id"] == run["run_id"]
+    assert payload["run_status"] == "queued"
+    assert [item["id"] for item in payload["items"]] == [current.id]
+    assert historical.id not in {item["id"] for item in payload["items"]}
+    assert legacy_source.id not in {item["id"] for item in payload["items"]}
+
+
+def test_canon_candidate_list_reports_queued_run_without_candidates(client, db):
+    """Canon 尚在 queued 且没有候选时，读取仍返回当前 run 和来源修订。"""
+    project = _create_project(client)
+    volume = _create_volume(client, project["id"])
+    chapter, _ = _setup_chapter(db, client, volume["id"])
+    scene, scene_rev_id = _setup_scene(db, client, chapter["id"])
+    run = _make_canon_run_scene(client, scene["id"], scene_rev_id, "canon-list-empty")
+
+    response = client.get(f"/api/scenes/{scene['id']}/canon-candidates")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["source_revision_id"] == scene_rev_id
+    assert payload["run_id"] == run["run_id"]
+    assert payload["run_status"] == "queued"
+    assert payload["items"] == []
 
 
 def test_chapter_accepted_event_auto_enqueue_and_idempotent_consume(client, db):
@@ -850,6 +975,9 @@ def test_decision_rejects_candidate_from_other_run(client, db):
     chapter, rev_id = _setup_chapter(db, client, volume["id"])
     project_id = _project_id(db, chapter["id"])
     run_a, cand_a = _prepare_cancel_run(client, db, chapter["id"], rev_id, "oa-key", claim="ca", local_key="oa")
+    # 只有活动运行按来源复用；终态运行保留其候选，供本测试验证跨运行绑定校验。
+    db.get(GenerationRun, run_a).status = "failed"
+    db.commit()
     run_b, _ = _prepare_cancel_run(client, db, chapter["id"], rev_id, "ob-key", claim="cb", local_key="ob")
     # 对 run_b 提交 run_a 的候选 -> 拒绝。
     body = _decision_body(run_b, "ob", [

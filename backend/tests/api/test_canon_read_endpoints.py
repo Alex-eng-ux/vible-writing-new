@@ -29,6 +29,8 @@ from app.domain.story_bible import upsert_canon_candidates
 from .conftest import _create_project, _create_volume
 from .test_canon_api import (
     _candidate_payload,
+    _make_canon_run,
+    _make_canon_run_scene,
     _setup_chapter,
     _setup_scene,
 )
@@ -202,25 +204,26 @@ def test_scene_candidates_returns_three_types_sorted(client, db) -> None:
     project = _create_project(client)
     volume = _create_volume(client, project["id"])
     chapter, rev_id = _setup_chapter(db, client, volume["id"])
-    scene, _ = _setup_scene(db, client, chapter["id"])
+    scene, scene_rev_id = _setup_scene(db, client, chapter["id"])
     project_id = _project_id(db, chapter["id"])
+    run = _make_canon_run_scene(client, scene["id"], scene_rev_id, "read-scene-1")
 
     payloads = [
-        _candidate_payload(project_id, chapter["id"], rev_id, scope="scene", scene_id=scene["id"],
+        _candidate_payload(project_id, chapter["id"], scene_rev_id, scope="scene", scene_id=scene["id"],
                            ctype="plot_thread", local_key="lp", claim="p",
                            content={"claim": "p", "entity_id": None, "paragraph_ref": "p3",
                                     "effective_story_time": {"value": "第3章", "precision": "exact"},
                                     "narrative_knowledge": "objective",
                                     "state": "advanced", "planned_resolution": "第5章"}),
-        _candidate_payload(project_id, chapter["id"], rev_id, scope="scene", scene_id=scene["id"],
+        _candidate_payload(project_id, chapter["id"], scene_rev_id, scope="scene", scene_id=scene["id"],
                            ctype="fact", local_key="lf", claim="f"),
-        _candidate_payload(project_id, chapter["id"], rev_id, scope="scene", scene_id=scene["id"],
+        _candidate_payload(project_id, chapter["id"], scene_rev_id, scope="scene", scene_id=scene["id"],
                            ctype="timeline_event", local_key="le", claim="e",
                            content={"claim": "e", "entity_id": None, "paragraph_ref": "p3",
                                     "effective_story_time": {"value": "第3章", "precision": "exact"},
                                     "narrative_knowledge": "objective"}),
     ]
-    _seed_candidates(db, "run-scene-1", payloads)
+    _seed_candidates(db, run["run_id"], payloads)
 
     resp = client.get(f"/api/scenes/{scene['id']}/canon-candidates")
     assert resp.status_code == 200
@@ -240,14 +243,15 @@ def test_scene_candidates_empty_and_isolated(client, db) -> None:
     project = _create_project(client)
     volume = _create_volume(client, project["id"])
     chapter, rev_id = _setup_chapter(db, client, volume["id"])
-    scene_a, _ = _setup_scene(db, client, chapter["id"])
+    scene_a, scene_a_rev_id = _setup_scene(db, client, chapter["id"])
     scene_b, _ = _setup_scene(db, client, chapter["id"])
     project_id = _project_id(db, chapter["id"])
+    run = _make_canon_run_scene(client, scene_a["id"], scene_a_rev_id, "read-scene-2")
 
     # 只给 scene_a 播种一条 fact 候选。
     _seed_candidates(
-        db, "run-scene-2",
-        [_candidate_payload(project_id, chapter["id"], rev_id, scope="scene",
+        db, run["run_id"],
+        [_candidate_payload(project_id, chapter["id"], scene_a_rev_id, scope="scene",
                             scene_id=scene_a["id"], ctype="fact", local_key="la", claim="a")],
     )
 
@@ -272,8 +276,10 @@ def test_chapter_candidates_returns_three_types_and_excludes_scene_level(client,
     project = _create_project(client)
     volume = _create_volume(client, project["id"])
     chapter, rev_id = _setup_chapter(db, client, volume["id"])
-    scene, _ = _setup_scene(db, client, chapter["id"])
+    scene, scene_rev_id = _setup_scene(db, client, chapter["id"])
     project_id = _project_id(db, chapter["id"])
+    chapter_run = _make_canon_run(client, chapter["id"], rev_id, "read-chapter-1")
+    scene_run = _make_canon_run_scene(client, scene["id"], scene_rev_id, "read-chapter-scene-1")
 
     payloads = [
         _candidate_payload(project_id, chapter["id"], rev_id, scope="chapter",
@@ -290,10 +296,19 @@ def test_chapter_candidates_returns_three_types_and_excludes_scene_level(client,
                                     "narrative_knowledge": "objective",
                                     "state": "open", "planned_resolution": "第6章"}),
         # 场景级候选：必须在章节端点中不可见。
-        _candidate_payload(project_id, chapter["id"], rev_id, scope="scene",
+        _candidate_payload(project_id, chapter["id"], scene_rev_id, scope="scene",
                            scene_id=scene["id"], ctype="fact", local_key="sf", claim="sf"),
     ]
-    _seed_candidates(db, "run-chapter-1", payloads)
+    _seed_candidates(
+        db,
+        chapter_run["run_id"],
+        [payload for payload in payloads if payload["scope"] == "chapter"],
+    )
+    _seed_candidates(
+        db,
+        scene_run["run_id"],
+        [payload for payload in payloads if payload["scope"] == "scene"],
+    )
 
     resp = client.get(f"/api/chapters/{chapter['id']}/canon-candidates")
     assert resp.status_code == 200

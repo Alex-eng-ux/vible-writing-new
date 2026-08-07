@@ -22,7 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from app.agents.model_provider import DeepSeekModelProvider
-from app.db.models import Chapter, GenerationRun, RunEvent, Volume
+from app.db.models import Chapter, ChapterPlanRevision, GenerationRun, RunEvent, Volume
 from app.domain.chapters import (
     accept_chapter_plan_revision,
     create_chapter,
@@ -39,7 +39,6 @@ _SYSTEM_REVIEW = "You are a chapter review agent"
 
 # 章节运行在 worker 下不会创建的业务表（聚合未装配，不写版本/handoff/Canon）。
 _WRITE_TABLES = (
-    "chapter_plan_revisions",
     "chapter_revisions",
     "chapter_handoffs",
     "fact_candidates",
@@ -163,8 +162,8 @@ def _worker(factory, *, wiring=None, provider=None):
     return RunWorker(factory, actor_id="worker-1", observability=wiring, provider=provider)
 
 
-def test_worker_chapter_chain_success_reaches_pause_without_writes(db) -> None:
-    """成功链路：Worker 驱动 ChapterGraph，Planner -> Review 均被真实 Provider 调用，暂停且无版本写入。"""
+def test_worker_chapter_chain_success_persists_pending_plan_and_pauses(db) -> None:
+    """new_chapter 规划只持久化 pending 候选并暂停，不进入章节审校。"""
     chapter_id = _make_chapter_with_plan(db, contract={"pov": "p", "scene_keys": ["s1", "s2"]})
     run_id = "g-ch-worker-1"
     _create_chapter_run(db, run_id, chapter_id)
@@ -188,15 +187,17 @@ def test_worker_chapter_chain_success_reaches_pause_without_writes(db) -> None:
     events = _events(db, run_id)
     assert events[0] == "run_queued"
     assert len(events) == 2
-    # 章节图两个模型 Agent 均被真实 Provider（mock）调用一次。
-    assert seen_nodes == ["planner", "review"]
-    # 无任何章节版本/plan/Canon/handoff 落库。
+    # 首次规划阶段只调用 Planner；章节审校必须等待计划接受和场景队列完成。
+    assert seen_nodes == ["planner"]
+    candidate = db.query(ChapterPlanRevision).filter_by(source_run_id=run_id).one()
+    assert candidate.status == "pending"
+    # 未生成章节版本/Canon/handoff。
     _assert_no_writes(db, before)
-    # 观测自动埋点：planner / review 挂载 llm 节点。
+    # 观测自动埋点：Planner 节点挂载 LLM 观测；章节审校尚未启动。
     assert wiring.local is not None
     node_names = [str(r.get("node_name")) for r in wiring.local.records]
     assert any(n.startswith("chapter_planner:llm:") for n in node_names)
-    assert any(n.startswith("chapter_review:llm:") for n in node_names)
+    assert not any(n.startswith("chapter_review:llm:") for n in node_names)
 
 
 def test_worker_chapter_chain_missing_contract_never_calls_model(db) -> None:

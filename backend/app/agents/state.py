@@ -36,6 +36,11 @@ class ChapterRunState(TypedDict, total=False):
     plan_revision_id: str | None
     draft_artifact_id: str | None
     clarification_questions: list[str]
+    # Planner 候选只作为当前运行的结构化中间结果传给 Worker 持久化；
+    # 不代表 accepted plan，也不供场景/Canon Agent 直接消费。
+    planner_output: dict | None
+    chapter_review_output: dict | None
+    staged_chapter_revision_id: str | None
     scene_auto_revision_counts: dict[str, int]
     parent_generation_run_id: str | None
     supersedes_run_id: str | None

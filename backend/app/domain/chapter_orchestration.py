@@ -30,6 +30,9 @@ from sqlalchemy.orm import Session
 from ..db.models import (
     Chapter,
     ChapterHandoff,
+    ChapterPlanRevision,
+    ChapterPlanRevisionLink,
+    ChapterPlanSceneLink,
     ChapterRevision,
     Scene,
 )
@@ -127,6 +130,22 @@ def valid_entry_handoff(
 
 
 def _scene_ids(session: Session, chapter_id: str) -> list[str]:
+    accepted_link = session.execute(
+        select(ChapterPlanRevisionLink)
+        .join(ChapterPlanRevision, ChapterPlanRevision.id == ChapterPlanRevisionLink.plan_revision_id)
+        .where(ChapterPlanRevisionLink.chapter_id == chapter_id, ChapterPlanRevision.status == "accepted")
+    ).scalar_one_or_none()
+    if accepted_link is not None:
+        planned_scene_ids = [
+            row[0]
+            for row in session.execute(
+                select(ChapterPlanSceneLink.scene_id)
+                .where(ChapterPlanSceneLink.plan_revision_id == accepted_link.plan_revision_id)
+                .order_by(ChapterPlanSceneLink.sort_order)
+            ).all()
+        ]
+        if planned_scene_ids:
+            return planned_scene_ids
     return [
         row[0]
         for row in session.execute(

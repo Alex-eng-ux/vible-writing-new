@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -111,7 +112,7 @@ def _system_prompt_of(req: httpx.Request) -> str:
     return body["messages"][0]["content"]
 
 
-def _graph(*, provider) -> ChapterGraph:
+def _graph(*, provider, aggregator=None) -> ChapterGraph:
     from app.agents.chapter_planner import ChapterPlannerAgent
     from app.agents.chapter_review_agent import ChapterReviewAgent
 
@@ -120,10 +121,33 @@ def _graph(*, provider) -> ChapterGraph:
         router=AgentResultRouter(),
         planner=ChapterPlannerAgent(provider=provider),
         review=ChapterReviewAgent(provider=provider),
+        aggregator=aggregator,
     )
 
 
-def test_real_chapter_chain_success_runs_planner_and_review() -> None:
+def _chapter_review_envelope() -> AgentInputEnvelope:
+    envelope = _envelope()
+    return envelope.model_copy(
+        update={
+            "request_type": "review",
+            "runtime_context": envelope.runtime_context.model_copy(
+                update={"decision_target": "chapter"}
+            ),
+        }
+    )
+
+
+class _EligibleAggregator:
+    """测试用章节聚合器：验证章节审校入口确实先执行聚合。"""
+
+    def eligibility(self, *args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(eligible=True, reason="", status="ready")
+
+    def aggregate(self, *args: object, **kwargs: object) -> str:
+        return "staged-chapter-revision"
+
+
+def test_real_chapter_chain_success_runs_aggregate_and_review() -> None:
     """成功链路：Planner -> Review 均经 provider 返回结构化结果，无版本/Canon/handoff 写入。"""
     seen_nodes: list[str] = []
 
@@ -134,17 +158,16 @@ def test_real_chapter_chain_success_runs_planner_and_review() -> None:
 
     wiring = ObservabilityWiring(sink=LocalSink(), environment="evaluation")
     provider = _real_provider(httpx.MockTransport(handler), wiring=wiring)
-    graph = _graph(provider=provider)
-    result = graph.invoke(_state(), _envelope(), thread_id="t-success")
+    graph = _graph(provider=provider, aggregator=_EligibleAggregator())
+    result = graph.invoke(_state(), _chapter_review_envelope(), thread_id="t-success")
     # 两个章节模型 Agent 均被真实 Provider（mock）调用一次。
-    assert seen_nodes == ["planner", "review"]
+    assert seen_nodes == ["review"]
     # 聚合节点未装配 aggregator -> 暂停等待作者（不产生任何版本/Canon/handoff 写入）。
-    assert result["run_status"] == "paused"
-    assert result["pending_node"] == "chapter_aggregator"
+    assert result["run_status"] == "running"
+    assert result["last_durable_node"] == "chapter_review"
     # 观测自动埋点：planner / review 挂载 llm 节点。
     assert wiring.local is not None
     node_names = [str(r.get("node_name")) for r in wiring.local.records]
-    assert any(n.startswith("chapter_planner:llm:") for n in node_names)
     assert any(n.startswith("chapter_review:llm:") for n in node_names)
 
 
@@ -170,9 +193,9 @@ def test_real_chapter_chain_review_timeout_fails() -> None:
         return _ok_response(_system_prompt_of(req))
 
     provider = _real_provider(httpx.MockTransport(handler))
-    graph = _graph(provider=provider)
+    graph = _graph(provider=provider, aggregator=_EligibleAggregator())
     with pytest.raises(AppError) as exc:
-        graph.invoke(_state(), _envelope(), thread_id="t-timeout")
+        graph.invoke(_state(), _chapter_review_envelope(), thread_id="t-timeout")
     assert exc.value.code == "LLM_UNAVAILABLE"
 
 

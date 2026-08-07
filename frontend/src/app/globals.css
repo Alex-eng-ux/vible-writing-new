@@ -165,6 +165,190 @@ h1 {
   background: var(--card);
 }
 
+.chapter-item {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  padding: 0.25rem;
+  cursor: pointer;
+}
+
+.chapter-item:hover {
+  color: var(--accent);
+}
+
+.chapter-workspace {
+  display: grid;
+  gap: 1rem;
+  max-width: 860px;
+}
+
+.chapter-canon-summary,
+.chapter-review-actions {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  padding: 0.75rem;
+}
+
+.chapter-canon-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.chapter-canon-heading h3 {
+  margin: 0;
+}
+
+.chapter-canon-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.chapter-canon-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0.75rem 0 0;
+}
+
+.chapter-canon-metrics div {
+  min-width: 0;
+}
+
+.chapter-canon-metrics dt {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.chapter-canon-metrics dd {
+  margin: 0.15rem 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chapter-review-actions {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.chapter-review-actions button {
+  justify-self: start;
+  background: var(--accent);
+  border: 0;
+  color: #06202e;
+  border-radius: 6px;
+  padding: 0.45rem 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chapter-review-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.chapter-review-actions textarea {
+  width: 100%;
+  resize: vertical;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 0.6rem;
+  font: inherit;
+}
+
+.chapter-review-issues {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: var(--warning);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 760px) {
+  .chapter-canon-metrics {
+    grid-template-columns: 1fr;
+  }
+}
+
+.chapter-workspace-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.75rem;
+}
+
+.chapter-workspace-heading span,
+.chapter-scene-queue span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.chapter-workspace textarea {
+  width: 100%;
+  resize: vertical;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 0.6rem;
+  font: inherit;
+}
+
+.chapter-workflow-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.chapter-workflow-actions button {
+  background: var(--accent);
+  border: 0;
+  color: #06202e;
+  border-radius: 6px;
+  padding: 0.45rem 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chapter-workflow-blocked {
+  border-left: 3px solid var(--danger);
+  background: rgba(248, 113, 113, 0.1);
+  padding: 0.65rem 0.8rem;
+}
+
+.chapter-discussion,
+.chapter-plan-candidate,
+.chapter-scene-queue {
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.chapter-plan-candidate li,
+.chapter-scene-queue li {
+  display: flex;
+  gap: 0.65rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+}
+
+.chapter-plan-candidate li span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .inline-form {
   display: flex;
   gap: 0.4rem;

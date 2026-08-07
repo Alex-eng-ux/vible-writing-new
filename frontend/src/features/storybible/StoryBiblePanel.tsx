@@ -35,7 +35,7 @@ import type {
 /** 场景/章节级候选目标（后端 canon_scope 决定来源版本与物化语义）。 */
 export type CanonTarget = {
   projectId: string;
-  scene: { id: string; title: string; acceptedRevisionId: string | null };
+  scene: { id: string; title: string; acceptedRevisionId: string | null } | null;
   chapter: { id: string; title: string; acceptedRevisionId: string | null };
 };
 
@@ -71,10 +71,12 @@ type Decision = "confirm" | "reject" | "defer";
 
 export default function StoryBiblePanel({ target, onStatus }: Props) {
   // 当前候选目标作用域：scene（默认）或 chapter。
-  const [scope, setScope] = useState<"scene" | "chapter">("scene");
+  const [scope, setScope] = useState<"scene" | "chapter">(target.scene ? "scene" : "chapter");
   const [canon, setCanon] = useState<CanonSnapshot | null>(null);
   const [candidates, setCandidates] = useState<CanonCandidate[]>([]);
   const [run, setRun] = useState<RunSnapshot | null>(null);
+  // 当前服务端确认的 accepted 来源；不从候选条目反推，避免历史候选串线。
+  const [currentSourceRevisionId, setCurrentSourceRevisionId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // 逐条决策选择（候选 id -> 决策）；由"提交决策"统一成一批调用。
   const [selections, setSelections] = useState<Record<string, Decision>>({});
@@ -83,61 +85,68 @@ export default function StoryBiblePanel({ target, onStatus }: Props) {
 
   const scopeLabel = scope === "scene" ? "场景" : "章节";
   const acceptedRevisionId =
-    scope === "scene" ? target.scene.acceptedRevisionId : target.chapter.acceptedRevisionId;
+    scope === "scene" && target.scene ? target.scene.acceptedRevisionId : target.chapter.acceptedRevisionId;
+
+  useEffect(() => {
+    setCurrentSourceRevisionId(acceptedRevisionId);
+  }, [acceptedRevisionId]);
 
   function errorMessage(e: unknown): string {
     if (e instanceof ApiError) return `${e.code}: ${e.message}`;
     return e instanceof Error ? e.message : String(e);
   }
 
-  // 拉取正式 Canon + 当前作用域候选；运行未知时从候选回溯 generation_run_id。
+  // 拉取正式 Canon + 当前 accepted 来源的候选和 Canon run。
   const refresh = useCallback(async () => {
     setBusy(true);
     try {
       const [snap, list] = await Promise.all([
         getProjectCanon(target.projectId),
-        scope === "scene"
+        scope === "scene" && target.scene
           ? getSceneCanonCandidates(target.scene.id)
           : getChapterCanonCandidates(target.chapter.id),
       ]);
       setCanon(snap);
       setCandidates(list.items);
-      const runId = list.items.find((c) => c.generation_run_id)?.generation_run_id ?? null;
-      if (runId) {
-        setRun(await getRun(runId));
+      setCurrentSourceRevisionId(list.source_revision_id);
+      if (list.run_id) {
+        setRun(await getRun(list.run_id));
+      } else {
+        setRun(null);
       }
     } catch (e) {
       onStatus(errorMessage(e));
     } finally {
       setBusy(false);
     }
-  }, [target.projectId, target.scene.id, target.chapter.id, scope, onStatus]);
+  }, [target.projectId, target.scene?.id, target.chapter.id, scope, onStatus]);
 
   useEffect(() => {
     // 目标作用域切换后重置本地选择并重新加载。
     setSelections({});
     decisionKeyRef.current = null;
+    setRun(null);
     void refresh();
   }, [refresh, scope]);
 
   /** 创建当前作用域的 Canon 运行（候选提取由占位 Worker/固定 fixture 完成）。 */
   async function handleStartExtract() {
-    if (!acceptedRevisionId || busy) return;
+    if (!currentSourceRevisionId || busy || runInFlight) return;
     setBusy(true);
     try {
-      const key = createIdempotencyKey("canon_run", scope === "scene" ? target.scene.id : target.chapter.id);
+      const key = createIdempotencyKey("canon_run", scope === "scene" && target.scene ? target.scene.id : target.chapter.id);
       const created =
-        scope === "scene"
+        scope === "scene" && target.scene
           ? await createSceneCanonRun(target.scene.id, {
               canon_scope: "scene",
-              accepted_scene_revision_id: acceptedRevisionId,
+              accepted_scene_revision_id: currentSourceRevisionId,
             }, key)
           : await createChapterCanonRun(target.chapter.id, {
               canon_scope: "chapter",
-              accepted_chapter_revision_id: acceptedRevisionId,
+              accepted_chapter_revision_id: currentSourceRevisionId,
             }, key);
       setRun(created);
-      onStatus(`已创建${scopeLabel}级 Canon 运行 ${created.run_id.slice(0, 8)}，等待提取结果…`);
+      onStatus(`已关联${scopeLabel}级 Canon 运行 ${created.run_id.slice(0, 8)}，等待提取结果…`);
       // 候选由外部 fixture 播种；创建后先刷新一次（可能已就绪）。
       await refresh();
     } catch (e) {
@@ -194,6 +203,9 @@ export default function StoryBiblePanel({ target, onStatus }: Props) {
   const pendingCount = candidates.filter((c) => c.status === "pending").length;
   const selectionCount = Object.keys(selections).length;
   const canSubmit = run?.status === "waiting_feedback" && selectionCount > 0;
+  const runInFlight =
+    run !== null &&
+    ["queued", "running", "waiting_feedback", "pending_clarification", "paused"].includes(run.status);
 
   return (
     <div className="story-bible-panel" data-testid="story-bible-panel">
@@ -201,14 +213,16 @@ export default function StoryBiblePanel({ target, onStatus }: Props) {
 
       {/* 目标作用域切换 */}
       <div className="canon-scope-switch">
-        <button
-          className={scope === "scene" ? "active" : ""}
-          data-testid="btn-canon-scope-scene"
-          onClick={() => setScope("scene")}
-          disabled={busy}
-        >
-          场景：{target.scene.title}
-        </button>
+        {target.scene && (
+          <button
+            className={scope === "scene" ? "active" : ""}
+            data-testid="btn-canon-scope-scene"
+            onClick={() => setScope("scene")}
+            disabled={busy}
+          >
+            场景：{target.scene.title}
+          </button>
+        )}
         <button
           className={scope === "chapter" ? "active" : ""}
           data-testid="btn-canon-scope-chapter"
@@ -245,8 +259,14 @@ export default function StoryBiblePanel({ target, onStatus }: Props) {
           <button
             data-testid="btn-canon-start"
             onClick={() => void handleStartExtract()}
-            disabled={busy || !acceptedRevisionId}
-            title={acceptedRevisionId ? undefined : "尚无 accepted 版本，无法开始提取"}
+            disabled={busy || !currentSourceRevisionId || runInFlight}
+            title={
+              runInFlight
+                ? "当前来源版本已有 Canon 运行处理中"
+                : currentSourceRevisionId
+                  ? undefined
+                  : "尚无 accepted 版本，无法开始提取"
+            }
           >
             {scopeLabel} 提取候选
           </button>
@@ -254,7 +274,7 @@ export default function StoryBiblePanel({ target, onStatus }: Props) {
             刷新
           </button>
         </div>
-        {!acceptedRevisionId && (
+        {!currentSourceRevisionId && (
           <p className="canon-hint">当前{scopeLabel}尚无 accepted 版本，先接受场景/章节版本后再提取。</p>
         )}
         {run && (

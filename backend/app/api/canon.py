@@ -19,9 +19,12 @@ from sqlalchemy.orm import Session
 
 from ..db.models import (
     CanonFact,
+    Chapter,
     FactCandidate,
+    GenerationRun,
     PlotThread,
     PlotThreadUpdate,
+    Scene,
     TimelineEvent,
     TimelineEventCandidate,
 )
@@ -67,6 +70,43 @@ def _candidate_projection(row) -> dict:
         "local_key": row.local_key,
         "generation_run_id": row.generation_run_id,
     }
+
+
+def _current_canon_source_and_run(
+    session: Session,
+    target_type: Literal["scene", "chapter"],
+    target_id: str,
+) -> tuple[str | None, GenerationRun | None]:
+    """返回目标当前 accepted 来源及该来源最新 Canon run。
+
+    候选表会保留历史来源和多次终态运行；只按目标 id 查询会把旧候选误展示到
+    新 accepted revision。这里先读取服务端 accepted 指针，再按来源修订选择
+    最新 Canon run，供候选列表和前端运行状态共同使用。没有 accepted 来源或
+    Canon run 时返回空快照，避免把无血缘候选暴露为当前状态。
+    """
+    if target_type == "chapter":
+        chapter_target = session.get(Chapter, target_id)
+        source_revision_id = chapter_target.accepted_chapter_revision_id if chapter_target else None
+        run_query = select(GenerationRun).where(
+            GenerationRun.chapter_id == target_id,
+            GenerationRun.scene_id.is_(None),
+            GenerationRun.decision_target == "canon",
+            GenerationRun.canon_source_revision_id == source_revision_id,
+        )
+    else:
+        scene_target = session.get(Scene, target_id)
+        source_revision_id = scene_target.accepted_scene_revision_id if scene_target else None
+        run_query = select(GenerationRun).where(
+            GenerationRun.scene_id == target_id,
+            GenerationRun.decision_target == "canon",
+            GenerationRun.canon_source_revision_id == source_revision_id,
+        )
+    if not source_revision_id:
+        return None, None
+    run = session.execute(
+        run_query.order_by(GenerationRun.created_at.desc(), GenerationRun.id.desc()).limit(1)
+    ).scalar_one_or_none()
+    return source_revision_id, run
 
 
 @router.get("/projects/{project_id}/canon", response_model=CanonSnapshotRead)
@@ -135,17 +175,28 @@ def get_scene_canon_candidates(
     scene_id: str,
     session: Session = Depends(get_db),
 ) -> CanonCandidateListRead:
-    """只读返回场景级 Canon 候选（scope=scene，含 pending 与已决策状态）。"""
+    """只读返回当前 accepted 场景来源对应的 Canon 候选与运行。"""
+    source_revision_id, run = _current_canon_source_and_run(session, "scene", scene_id)
     items: list[CanonCandidateRead] = []
-    for model_cls in _CANDIDATE_MODELS.values():
-        rows = session.execute(
-            select(model_cls).where(model_cls.scene_id == scene_id)
-        ).scalars().all()
-        items.extend(CanonCandidateRead(**_candidate_projection(r)) for r in rows)
+    if source_revision_id and run is not None:
+        for model_cls in _CANDIDATE_MODELS.values():
+            rows = session.execute(
+                select(model_cls).where(
+                    model_cls.scene_id == scene_id,
+                    model_cls.source_revision_id == source_revision_id,
+                    model_cls.generation_run_id == run.id,
+                )
+            ).scalars().all()
+            items.extend(CanonCandidateRead(**_candidate_projection(r)) for r in rows)
     # 按类型分组稳定排序（fact -> timeline_event -> plot_thread）。
     items.sort(key=lambda d: d.candidate_type)
     return CanonCandidateListRead(
-        target_type="scene", target_id=scene_id, items=items
+        target_type="scene",
+        target_id=scene_id,
+        source_revision_id=source_revision_id,
+        run_id=run.id if run else None,
+        run_status=run.status if run else None,
+        items=items,
     )
 
 
@@ -156,18 +207,28 @@ def get_chapter_canon_candidates(
     chapter_id: str,
     session: Session = Depends(get_db),
 ) -> CanonCandidateListRead:
-    """只读返回章节级 Canon 候选（scope=chapter，scene_id 为空）。"""
+    """只读返回当前 accepted 章节来源对应的 Canon 候选与运行。"""
+    source_revision_id, run = _current_canon_source_and_run(session, "chapter", chapter_id)
     items: list[CanonCandidateRead] = []
-    for model_cls in _CANDIDATE_MODELS.values():
-        rows = session.execute(
-            select(model_cls).where(
-                model_cls.chapter_id == chapter_id, model_cls.scene_id.is_(None)
-            )
-        ).scalars().all()
-        items.extend(CanonCandidateRead(**_candidate_projection(r)) for r in rows)
+    if source_revision_id and run is not None:
+        for model_cls in _CANDIDATE_MODELS.values():
+            rows = session.execute(
+                select(model_cls).where(
+                    model_cls.chapter_id == chapter_id,
+                    model_cls.scene_id.is_(None),
+                    model_cls.source_revision_id == source_revision_id,
+                    model_cls.generation_run_id == run.id,
+                )
+            ).scalars().all()
+            items.extend(CanonCandidateRead(**_candidate_projection(r)) for r in rows)
     items.sort(key=lambda d: d.candidate_type)
     return CanonCandidateListRead(
-        target_type="chapter", target_id=chapter_id, items=items
+        target_type="chapter",
+        target_id=chapter_id,
+        source_revision_id=source_revision_id,
+        run_id=run.id if run else None,
+        run_status=run.status if run else None,
+        items=items,
     )
 
 

@@ -16,7 +16,7 @@ import type {
   CanonSnapshot,
   ChangeSetCreated,
   Chapter,
-  ChapterPlan,
+  ChapterWorkflowRead,
   ChapterRevision,
   DecisionResponse,
   ErrorEnvelope,
@@ -217,17 +217,27 @@ export const rollbackScene = (sceneId: string, targetRevisionId: string, key: st
   });
 
 // ---------------------------------------------------------------------------
-// Task 7B：运行 / 决策 / 恢复 / plan
+// Task 7B：运行 / 决策 / 恢复 / workflow
 // ---------------------------------------------------------------------------
 
-/** 读取章节当前 accepted plan（只读；场景运行创建的前提）。 */
-export const getChapterPlan = (chapterId: string) =>
-  requestJson<ChapterPlan>(`/api/chapters/${chapterId}/plan`);
+/** 读取章节工作台唯一权威状态，不由前端拼接多个最新记录。 */
+export const getChapterWorkflow = (chapterId: string) =>
+  requestJson<ChapterWorkflowRead>(`/api/chapters/${chapterId}/workflow`);
 
-/** 初始化并接受章节计划（幂等命令）：已存在 accepted plan 时直接返回当前指针。 */
-export const createChapterPlan = (chapterId: string, key: string) =>
-  requestJson<ChapterPlan>(`/api/chapters/${chapterId}/plan`, {
+export type ChapterRunRequest = {
+  run_scope: "chapter";
+  request_type: "new_chapter" | "review";
+  decision_target: "plan" | "chapter";
+  chapter_intent?: { text: string; [key: string]: unknown };
+  author_feedback?: { text: string; [key: string]: unknown };
+  plan_revision_id?: string;
+};
+
+/** 启动章节规划或章节审校运行；章节主流程不得调用旧 plan 初始化接口。 */
+export const createChapterRun = (chapterId: string, payload: ChapterRunRequest, key: string) =>
+  requestJson<RunSnapshot>(`/api/chapters/${chapterId}/runs`, {
     method: "POST",
+    body: payload,
     idempotencyKey: key,
   });
 
@@ -256,13 +266,17 @@ export type RunDecisionBody = {
   /** 必须等于请求头 Idempotency-Key（后端强制校验）。 */
   idempotency_key: string;
   expected_run_version: number;
-  target: "scene";
+  target: "plan" | "scene" | "chapter";
   decision: "accept" | "feedback" | "cancel";
   text?: string;
   /** 首稿场景接受时携带（运行产生的 draft，随 SSE 事件下发）。 */
   draft_artifact_id?: string;
   /** 已有 accepted 版本场景接受时携带（运行产生的 ChangeSet）。 */
   change_set_id?: string;
+  plan_revision_id?: string;
+  expected_current_plan_revision_id?: string | null;
+  expected_plan_version?: number | null;
+  chapter_revision_id?: string;
 };
 
 /** 作者决策：accept（接受）/ feedback（反馈或澄清回答）/ cancel（取消）。 */

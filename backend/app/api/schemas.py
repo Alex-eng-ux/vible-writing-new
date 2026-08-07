@@ -189,6 +189,10 @@ class ChapterRevisionRead(BaseModel):
     status: str
     reason: str
     created_at: str
+    scene_versions: list[dict] = Field(default_factory=list)
+    review_issues: list[dict] = Field(default_factory=list)
+    review_summary: dict = Field(default_factory=dict)
+    is_current_accepted: bool = False
 
 
 class ChapterHandoffRead(BaseModel):
@@ -247,6 +251,8 @@ class RunSnapshot(BaseModel):
     target_id: str
     run_scope: Literal["chapter", "scene"]
     request_type: str
+    plan_revision_id: str | None = None
+    base_scene_revision_id: str | None = None
     status: Literal[
         "queued", "running", "waiting_feedback", "pending_clarification",
         "paused", "accepted", "cancelled", "failed", "superseded",
@@ -297,6 +303,8 @@ class DecisionRequest(BaseModel):
     chapter_revision_id: str | None = None
     candidate_decisions: list[CandidateDecisionItem] = Field(default_factory=list)
     canon_feedback: dict | None = None
+    # 章节规划反馈采用结构化问题/建议决策；旧客户端仍可使用 text。
+    feedback: dict | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -391,6 +399,59 @@ class ChapterPlanRead(BaseModel):
     plan_reason: str | None = None
 
 
+class PlanPendingQuestionRead(BaseModel):
+    question_id: str
+    text: str
+    impact: str = ""
+
+
+class PlanPendingProposalRead(BaseModel):
+    proposal_id: str
+    field_path: str
+    value: Any = None
+    source: Literal["ai"] = "ai"
+    status: Literal["pending", "accepted", "modified", "rejected"] = "pending"
+    rationale: str = ""
+
+
+class PlanDiscussionMessageRead(BaseModel):
+    message_id: str
+    message_sequence: int
+    role: Literal["author", "planner"]
+    agent: Literal["ChapterPlannerAgent"] | None = None
+    kind: Literal["intent", "question", "answer", "feedback", "proposal", "decision"]
+    text: str
+    created_at: str
+    source_run_id: str | None = None
+    parent_run_id: str | None = None
+    supersedes_run_id: str | None = None
+    checkpoint_id: str | None = None
+
+
+class ChapterWorkflowRead(BaseModel):
+    """章节工作台的权威组合读取视图；前端不得自行拼接最新记录。"""
+
+    chapter_id: str
+    phase: Literal[
+        "intent_required", "planning", "plan_feedback", "scene_generation",
+        "scene_feedback", "chapter_review", "chapter_feedback", "canon_feedback",
+        "completed", "blocked",
+    ]
+    chapter_status: str
+    pending_decision: dict
+    intent: dict
+    plan_discussion: dict
+    plan: dict
+    scenes: list[dict] = Field(default_factory=list)
+    chapter_revision: dict
+    active_run: dict | None = None
+    affected_scene_ids: list[str] = Field(default_factory=list)
+    stale_scene_ids: list[str] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(default_factory=list)
+    canon_run_id: str | None = None
+    canon: dict = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Task 7C：只读 Story Bible / Canon 候选 schema（只追加，不修改冻结字段）。
 # ---------------------------------------------------------------------------
@@ -452,4 +513,7 @@ class CanonCandidateListRead(BaseModel):
 
     target_type: Literal["scene", "chapter"]
     target_id: str
+    source_revision_id: str | None = None
+    run_id: str | None = None
+    run_status: str | None = None
     items: list[CanonCandidateRead] = Field(default_factory=list)

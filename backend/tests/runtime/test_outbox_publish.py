@@ -35,7 +35,12 @@ def _hierarchy(db):
 
 
 def _start_run(db, chapter) -> str:
-    body = RunCreateRequest(run_scope="chapter", request_type="new_chapter", decision_target="plan")
+    body = RunCreateRequest(
+        run_scope="chapter",
+        request_type="new_chapter",
+        decision_target="plan",
+        chapter_intent={"text": "测试章节意图"},
+    )
     return start_generation_run(db, "a", chapter.id, body, "manual-1", "key-1")["run_id"]
 
 

@@ -8,13 +8,31 @@
  * - 断言所有 POST 命令请求都携带 Idempotency-Key。
  */
 
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+
+const BACKEND = path.resolve(__dirname, "..", "..", "backend");
+const FIXTURE_PY = ".venv\\Scripts\\python.exe";
 
 let _seq = 0;
 
 async function apiKey(prefix: string): Promise<string> {
   _seq += 1;
   return `${prefix}-${_seq}-${Date.now()}`;
+}
+
+/** 运行确定性 E2E fixture，创建已接受的章节计划，不调用旧初始化 API。 */
+function seedAcceptedPlan(chapterId: string): string {
+  return execFileSync(FIXTURE_PY, ["-m", "app.db.e2e_fixtures", "seed-plan", "--chapter-id", chapterId], {
+    cwd: BACKEND,
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      E2E_DATABASE_URL: "postgresql+psycopg://postgres:postgres@localhost:5432/novel_e2e",
+    },
+  }).trim();
 }
 
 /** 通过代理创建 项目/卷/章/场景 层级，返回各资源 id。 */
@@ -291,13 +309,31 @@ test("context menu deletes a project after confirmation", async ({ page, request
   await expect(project).not.toBeVisible();
 });
 
-test("displays the generated chapter plan", async ({ page, request }) => {
+test("scene workspace loads plan state from workflow and keeps the editor usable", async ({
+  page,
+  request,
+}) => {
   const prefix = `plan-ui-${Date.now()}`;
-  await createHierarchy(request, prefix);
+  const { chapterId } = await createHierarchy(request, prefix);
+  const planRevisionId = seedAcceptedPlan(chapterId);
+  expect(planRevisionId).toBeTruthy();
+
+  const legacyPlanRequests: string[] = [];
+  page.on("request", (req) => {
+    if (req.method() === "GET" && req.url().includes("/api/chapters/") && req.url().endsWith("/plan")) {
+      legacyPlanRequests.push(req.url());
+    }
+  });
+
   await openScene(page, `${prefix}-P`, "场景");
 
-  await page.getByRole("button", { name: "生成章节计划" }).click();
-  await expect(page.getByTestId("status-message")).toContainText("章节计划已就绪");
-  await expect(page.getByTestId("chapter-plan-panel")).toContainText("init-plan");
-  await expect(page.getByTestId("chapter-plan-panel")).toContainText("场景");
+  await expect(page.getByTestId("chapter-plan-panel")).toBeVisible();
+  await expect(page.getByTestId("chapter-plan-panel")).toContainText("accepted");
+  await expect(page.getByTestId("chapter-plan-panel")).toContainText("e2e fixture outline");
+  expect(legacyPlanRequests).toEqual([]);
+
+  await page.locator(".tiptap").click();
+  await page.keyboard.type("计划迁移后仍可编辑", { delay: 5 });
+  await page.getByTestId("btn-save").click();
+  await expect(page.getByTestId("status-message")).toContainText("已保存并提交版本");
 });

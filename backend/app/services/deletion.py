@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 

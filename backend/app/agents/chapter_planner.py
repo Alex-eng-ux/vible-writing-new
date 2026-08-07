@@ -58,7 +58,7 @@ class ChapterPlannerAgent:
         失败条件：真实 Provider 调用失败抛 ``AppError(LLM_*)``；模型响应无法
         通过 `ChapterPlanOutput` 校验时抛 ``AppError(LLM_RESPONSE_INVALID)``。
         """
-        if not envelope.chapter_contract:
+        if not envelope.chapter_contract and not envelope.chapter_intent:
             return ChapterPlanOutput(
                 status="needs_clarification",
                 clarification_questions=["missing chapter contract"],
@@ -103,9 +103,19 @@ class ChapterPlannerAgent:
 
         parts = [
             f"项目：{envelope.project.get('name', envelope.project.get('id', ''))}",
+            "章节意图："
+            + json.dumps(envelope.chapter_intent, ensure_ascii=False)[:_CONTRACT_LIMIT],
             "章节契约："
             + json.dumps(envelope.chapter_contract, ensure_ascii=False)[:_CONTRACT_LIMIT],
         ]
+        if envelope.plan_discussion:
+            parts.append("规划讨论：" + json.dumps(envelope.plan_discussion, ensure_ascii=False)[:_CONTRACT_LIMIT])
+        if envelope.pending_plan_questions:
+            parts.append("待回答问题：" + json.dumps(envelope.pending_plan_questions, ensure_ascii=False)[:_CONTRACT_LIMIT])
+        if envelope.pending_plan_proposals:
+            parts.append("待确认建议：" + json.dumps(envelope.pending_plan_proposals, ensure_ascii=False)[:_CONTRACT_LIMIT])
+        if envelope.author_feedback.text:
+            parts.append("作者反馈：" + envelope.author_feedback.text[:_CONTRACT_LIMIT])
         source_ids = [e.source_id for e in envelope.context_manifest]
         if source_ids:
             parts.append("来源引用：" + ",".join(source_ids))
@@ -113,7 +123,10 @@ class ChapterPlannerAgent:
 
     def _run_fake(self, envelope: AgentInputEnvelope) -> ChapterPlanOutput:
         """确定性占位实现（Fake model 语义；未注入 Provider 时使用）。"""
-        contract = envelope.chapter_contract
+        contract = envelope.chapter_contract or {
+            "intent": envelope.chapter_intent.get("text", ""),
+            "pov": envelope.chapter_intent.get("pov", ""),
+        }
         scene_keys = contract.get("scene_keys") or ["scene-1", "scene-2"]
         return ChapterPlanOutput(
             status="ready",

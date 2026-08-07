@@ -12,12 +12,18 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Page, type Route } from "@playwright/test";
 
 const BACKEND = path.resolve(__dirname, "..", "..", "backend");
 const FIXTURE_PY = ".venv\\Scripts\\python.exe";
 
 let _seq = 0;
+
+// 测试结束时页面可能仍有后台 workflow 请求在路由回调中；先解除路由，
+// 避免页面销毁导致已在途的 mock 回调抛出 Response/request context disposed。
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});
 
 async function apiKey(prefix: string): Promise<string> {
   _seq += 1;
@@ -69,8 +75,13 @@ function fixture(...args: string[]): string {
 }
 
 /** 播种 accepted plan。 */
-function seedPlan(chapterId: string): string {
-  return fixture("seed-plan", "--chapter-id", chapterId);
+function seedPlan(chapterId: string, sceneId?: string): string {
+  return fixture(
+    "seed-plan",
+    "--chapter-id",
+    chapterId,
+    ...(sceneId ? ["--scene-id", sceneId] : []),
+  );
 }
 
 /** 播种场景 accepted 版本（固定正文）。 */
@@ -89,12 +100,22 @@ async function openScene(page: Page, projectName: string, sceneTitle: string) {
   await expect(page.getByTestId("nav-pane")).toBeVisible();
   await page.locator(".tree-label", { hasText: projectName }).getByRole("button", { name: "展开" }).click();
   await expect(page.getByTestId("input-volume-name")).toBeVisible();
-  await page.locator(".tree-label", { hasText: "V" }).getByRole("button", { name: "展开" }).click();
+  await page.locator(".tree-label").filter({ has: page.getByText("📖 V", { exact: true }) }).getByRole("button", { name: "展开" }).click();
   await expect(page.getByTestId("input-chapter-title")).toBeVisible();
-  await page.locator(".tree-label", { hasText: "章" }).getByRole("button", { name: "展开" }).click();
+  await page.locator(".tree-label").filter({ has: page.getByText("📃 章", { exact: true }) }).getByRole("button", { name: "展开" }).click();
   await expect(page.getByTestId("input-scene-title")).toBeVisible();
   await page.locator(".scene-item", { hasText: sceneTitle }).click();
   await expect(page.getByTestId("editor-pane")).toContainText(`场景：${sceneTitle}`);
+}
+
+/**
+ * 通过独立 API 上下文读取 workflow，避免 page.route 的 route.fetch 响应在
+ * 页面后台请求收尾时被 Playwright 提前销毁。
+ */
+async function fetchWorkflowForRoute(route: Route, request: APIRequestContext) {
+  const response = await request.get(route.request().url());
+  const body = (await response.json()) as Record<string, unknown>;
+  return { response, body };
 }
 
 /** 打开场景并启动一个 review 运行（审校）。 */
@@ -108,7 +129,7 @@ async function startReviewRun(page: Page, projectName: string): Promise<void> {
 test("选中片段续写创建运行（携带选中文本与幂等键）", async ({ page, request }) => {
   const prefix = `r1-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
   seedSceneAccepted(sceneId, "第一章开篇。");
 
   let runCreateBody: Record<string, unknown> | null = null;
@@ -146,6 +167,211 @@ test("选中片段续写创建运行（携带选中文本与幂等键）", async
 });
 
 /** 读取当前运行面板的完整 run_id。 */
+test("场景运行前置检查使用刷新后的 workflow plan 指针", async ({ page, request }) => {
+  const prefix = `workflow-refresh-${Date.now()}`;
+  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  seedPlan(chapterId, sceneId);
+  seedSceneAccepted(sceneId, "运行前检查需要最新计划");
+
+  let workflowReads = 0;
+  let runCreateBody: Record<string, unknown> | null = null;
+  await page.route("**/api/chapters/*/workflow", async (route) => {
+    workflowReads += 1;
+    const { response, body } = await fetchWorkflowForRoute(route, request);
+    const workflow = body as {
+      plan: { accepted_revision_id: string | null };
+      scenes: Array<Record<string, unknown>>;
+    };
+    workflow.scenes = [
+      {
+        scene_id: sceneId,
+        order: 0,
+        title: "场景",
+        status: "planned",
+        accepted_revision_id: null,
+        current_run_id: null,
+        blocking_reasons: [],
+      },
+    ];
+    if (workflowReads === 2) workflow.plan.accepted_revision_id = "latest-plan-from-refresh";
+    await route.fulfill({
+      status: response.status(),
+      headers: response.headers(),
+      json: body,
+    });
+  });
+  await page.route("**/api/scenes/*/runs", async (route) => {
+    runCreateBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        run_id: "run-workflow-refresh",
+        thread_id: "run-workflow-refresh",
+        project_id: "project",
+        target_id: sceneId,
+        run_scope: "scene",
+        request_type: "review",
+        status: "queued",
+        run_version: 1,
+        current_scene_id: sceneId,
+        current_node: null,
+        pending_node: null,
+        pause_reason: null,
+        clarification_questions: [],
+        last_error_code: null,
+        last_event_sequence: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }),
+    });
+  });
+
+  await openScene(page, `${prefix}-P`, "场景");
+  const readsBeforeRun = workflowReads;
+  await page.getByTestId("btn-review").click();
+  await expect(page.getByTestId("run-panel")).toBeVisible();
+  expect(workflowReads).toBeGreaterThan(readsBeforeRun);
+  expect(runCreateBody).not.toBeNull();
+  const capturedBody = runCreateBody as unknown as Record<string, unknown>;
+  expect(capturedBody.plan_revision_id).toBe("latest-plan-from-refresh");
+});
+
+test("workflow 阻断时不创建场景运行", async ({ page, request }) => {
+  const prefix = `workflow-blocked-${Date.now()}`;
+  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  seedPlan(chapterId, sceneId);
+  seedSceneAccepted(sceneId, "队列阻断时不得运行");
+
+  let runRequests = 0;
+  await page.route("**/api/chapters/*/workflow", async (route) => {
+    const { response, body } = await fetchWorkflowForRoute(route, request);
+    const workflow = body as {
+      phase: string;
+      blocking_reasons: string[];
+      scenes: Array<Record<string, unknown>>;
+    };
+    workflow.phase = "blocked";
+    workflow.blocking_reasons = ["scene_blocked:manual_gate"];
+    workflow.scenes = [
+      {
+        scene_id: sceneId,
+        order: 0,
+        title: "场景",
+        status: "planned",
+        accepted_revision_id: null,
+        current_run_id: null,
+        blocking_reasons: ["manual_gate"],
+      },
+    ];
+    await route.fulfill({
+      status: response.status(),
+      headers: response.headers(),
+      json: body,
+    });
+  });
+  await page.route("**/api/scenes/*/runs", async (route) => {
+    runRequests += 1;
+    await route.fulfill({ status: 500, contentType: "application/json", body: "{}" });
+  });
+
+  await openScene(page, `${prefix}-P`, "场景");
+  await page.getByTestId("btn-review").click();
+  await expect(page.getByTestId("status-message")).toContainText("scene_blocked:manual_gate");
+  expect(runRequests).toBe(0);
+});
+
+test("章节已有活动运行时不创建新的场景运行", async ({ page, request }) => {
+  const prefix = `chapter-active-run-${Date.now()}`;
+  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  seedPlan(chapterId, sceneId);
+  seedSceneAccepted(sceneId, "已有章节运行时不得重复启动");
+
+  let runRequests = 0;
+  await page.route("**/api/chapters/*/workflow", async (route) => {
+    const { response, body } = await fetchWorkflowForRoute(route, request);
+    const workflow = body as {
+      blocking_reasons: string[];
+      active_run: Record<string, unknown> | null;
+      scenes: Array<Record<string, unknown>>;
+    };
+    workflow.blocking_reasons = [];
+    workflow.active_run = {
+      run_id: "run-active-chapter",
+      status: "running",
+      run_scope: "chapter",
+      decision_target: "chapter",
+    };
+    workflow.scenes = [
+      {
+        scene_id: sceneId,
+        order: 0,
+        title: "场景",
+        status: "planned",
+        accepted_revision_id: null,
+        current_run_id: null,
+        blocking_reasons: [],
+      },
+    ];
+    await route.fulfill({
+      status: response.status(),
+      headers: response.headers(),
+      json: body,
+    });
+  });
+  await page.route("**/api/scenes/*/runs", async (route) => {
+    runRequests += 1;
+    await route.fulfill({ status: 500, contentType: "application/json", body: "{}" });
+  });
+
+  await openScene(page, `${prefix}-P`, "场景");
+  await page.getByTestId("btn-review").click();
+  await expect(page.getByTestId("status-message")).toContainText("run-active-chapter");
+  expect(runRequests).toBe(0);
+});
+
+test("场景处于运行中状态时不创建新的场景运行", async ({ page, request }) => {
+  const prefix = `scene-not-runnable-${Date.now()}`;
+  const { chapterId, sceneId } = await createHierarchy(request, prefix);
+  seedPlan(chapterId, sceneId);
+  seedSceneAccepted(sceneId, "运行中的场景不可重复启动");
+
+  let runRequests = 0;
+  await page.route("**/api/chapters/*/workflow", async (route) => {
+    const { response, body } = await fetchWorkflowForRoute(route, request);
+    const workflow = body as {
+      scenes: Array<Record<string, unknown>>;
+      active_run: Record<string, unknown> | null;
+    };
+    workflow.active_run = null;
+    workflow.scenes = [
+      {
+        scene_id: sceneId,
+        order: 0,
+        title: "场景",
+        status: "running",
+        accepted_revision_id: null,
+        current_run_id: "run-current-scene",
+        blocking_reasons: [],
+      },
+    ];
+    await route.fulfill({
+      status: response.status(),
+      headers: response.headers(),
+      json: body,
+    });
+  });
+  await page.route("**/api/scenes/*/runs", async (route) => {
+    runRequests += 1;
+    await route.fulfill({ status: 500, contentType: "application/json", body: "{}" });
+  });
+
+  await openScene(page, `${prefix}-P`, "场景");
+  await page.getByTestId("btn-review").click();
+  await expect(page.getByTestId("status-message")).toContainText("running");
+  expect(runRequests).toBe(0);
+});
+
 async function fullRunId(page: Page): Promise<string> {
   return (await page.getByTestId("run-id").getAttribute("data-full-run-id")) ?? "";
 }
@@ -153,7 +379,7 @@ async function fullRunId(page: Page): Promise<string> {
 test("审校问题展示并在服务端确认后接受（accepted 才显示版本）", async ({ page, request }) => {
   const prefix = `r2-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
 
   await startReviewRun(page, `${prefix}-P`);
   // accepted 未确认前：版本历史为空，不显示任何版本。
@@ -201,7 +427,7 @@ test("审校问题展示并在服务端确认后接受（accepted 才显示版�
 test("反馈后保持等待反馈状态", async ({ page, request }) => {
   const prefix = `r3-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
 
   await startReviewRun(page, `${prefix}-P`);
   const runId = await fullRunId(page);
@@ -218,7 +444,7 @@ test("反馈后保持等待反馈状态", async ({ page, request }) => {
 test("澄清恢复：pending_clarification 展示澄清问题，按钮与 API 不混用", async ({ page, request }) => {
   const prefix = `r4-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
 
   await startReviewRun(page, `${prefix}-P`);
   const runId = await fullRunId(page);
@@ -249,7 +475,7 @@ test("澄清恢复：pending_clarification 展示澄清问题，按钮与 API �
 test("暂停恢复：paused 仅显示恢复按钮，resume 后回到运行中", async ({ page, request }) => {
   const prefix = `r5-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
 
   await startReviewRun(page, `${prefix}-P`);
   const runId = await fullRunId(page);
@@ -270,7 +496,7 @@ test("暂停恢复：paused 仅显示恢复按钮，resume 后回到运行中", 
 test("SSE 断线通过 Last-Event-ID 重连并按事件 id 去重", async ({ page, request }) => {
   const prefix = `r6-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
 
   await openScene(page, `${prefix}-P`, "场景");
 
@@ -338,7 +564,7 @@ test("所有命令请求都携带 Idempotency-Key", async ({ page, request }) =>
   });
   const prefix = `r7-${Date.now()}`;
   const { chapterId, sceneId } = await createHierarchy(request, prefix);
-  seedPlan(chapterId);
+  seedPlan(chapterId, sceneId);
 
   await openScene(page, `${prefix}-P`, "场景");
   await page.getByTestId("btn-review").click();

@@ -13,7 +13,7 @@
 
 六项均保留了 Fake model 默认行为（未注入 provider 时确定性输出，普通测试不访问网络）。`RevisionAgent` 接线（场景图）于本会话前序已完成，本轮未见回归。
 
-本轮补充了二阶工作台设计审查，并根据用户确认修正章节规划交互语义：章节意图不应是作者必须一次性填满的结构化表单，而应允许作者先用自然语言表达想法，再由 AI 通过提问和可编辑建议逐步形成章节契约。本轮只修改设计文档和开发日志，没有修改应用代码。
+本轮补充了二阶工作台设计审查，并根据用户确认修正章节规划交互语义：章节意图不应是作者必须一次性填满的结构化表单，而应允许作者先用自然语言表达想法，再由 AI 通过提问和可编辑建议逐步形成章节契约。本轮继续校对现有 Agent 的真实字段使用，补充 Planner 专属 Prompt/Hook、Agent 职责收紧、共享信封字段投影和兼容迁移边界。本轮只修改设计文档和开发日志，没有修改应用代码。
 
 ## 用户主导决策
 
@@ -37,6 +37,9 @@
 | AI 推断的关键目标、状态、人物关系和必达剧情点只能作为建议 | 关键内容未经作者确认不得进入 accepted plan、正文基线、章节版本或正式 Canon；接受动作仍由作者决策和事务服务完成 | 二阶设计文档的 `plan_discussion`、建议来源标记和阻断验收；当前代码尚未实现建议确认字段 |
 | 二阶计划书核心目标压缩为一条端到端主流程，并将产品目标与工程约束分层 | 用户认为此前计划内容完整但不够简洁明了；保留“意图→Planner 讨论→计划展示→作者确认→自动逐场生成→逐场反馈/接受→章节聚合”作为唯一主线，API、状态、迁移和回归测试下沉到工程章节 | `docs/superpowers/specs/2026-08-05-chapter-workbench-v2-design.md` 已完成压缩 |
 | 恢复压缩前的完整工程交接版计划 | 用户确认精简版偏离初衷，要求恢复完整的前后端目标、状态、接口、前端、阶段交付、验收和风险内容；同时保留端到端主流程作为主线 | `docs/superpowers/specs/2026-08-05-chapter-workbench-v2-design.md` 已恢复为完整版本 |
+| 章节规划只由 `ChapterPlannerAgent` 承担，其他 Agent 收紧职责并复用现有能力 | 用户要求通过收紧 Agent 分工控制任务范围；不新增通用聊天 Agent，不把章节规划讨论逻辑扩散到 Writing、Continuity、Review、Revision、ChapterReview、Aggregator 或 Canon | 计划书新增 Agent 职责收紧与复用边界；其他 Agent 只适配 accepted plan、`SceneBrief`、版本指针和来源引用 |
+| 共享 `AgentInputEnvelope` 与各 Agent Prompt 分层处理 | 代码核对发现 Worker 会把多个字段装入共享信封，但不同 Agent 实际读取字段不同；不能把“信封携带”误写成“所有 Agent 都应读取” | 计划书新增共享信封、服务端投影、Agent 专属 Prompt 三层字段适配表和字段泄漏测试要求 |
+| Planner 的提示词和专属 Hook 必须作为独立实现任务 | 用户指出原计划只写了结果目标，没有明确 `CHAPTER_PLAN_SYSTEM_PROMPT`、`_build_prompt()` 和 Planner Hook 的改动逻辑 | 计划书新增 Planner 输入/提示词/`PlannerDiscussionHook` 章节，并规定其与 `SchemaHook`、`AgentResultRouter`、`ChapterGraph` 的接线顺序 |
 
 ## 关键规则与取舍
 
@@ -51,6 +54,9 @@
 - **章节规划对话边界**：最小输入只要求非空自然语言意图；题材、目标读者、文风、章节目标、开场/结尾状态、POV、必达和禁止事项均可选。AI 可以提问或提出可编辑建议；只有作者回答、采纳或修改后，内容才能冻结为 `ChapterContract`。
 - **Planner Agent 复用**：AI 讨论不是独立通用聊天 Agent，而是 `ChapterPlannerAgent` 在初次规划、澄清恢复和计划反馈场景下的多轮调用；`RunService`、`AgentResultRouter` 和 checkpoint 负责保存讨论与恢复，不负责生成内容。
 - **当前 Hook 边界**：通用 `SchemaHook` 已要求 `needs_clarification` 携带问题，`AgentResultRouter` 已设置 `pending_node` 并暂停，`ChapterGraph` 已支持 checkpoint 恢复；二阶设计需要新增 Planner 输入上下文/建议归一化边界，且 Hook 不直接写正式计划。
+- **Planner 专属接线边界**：二阶实现只新增 `PlannerDiscussionHook` 并接入章节 Planner 结果链路；执行顺序固定为 `SchemaHook → PlannerDiscussionHook → AgentResultRouter`，Hook 只做讨论上下文归一化、建议来源/确认状态和阻断校验，不写计划、场景或 Canon。
+- **Agent 字段投影边界**：`AgentInputEnvelope` 是共享传输信封，不等于 Prompt 输入；服务端必须按 Planner、场景图、章节审校和 Canon 图投影最小字段，Planner 讨论不得泄漏到其他 Agent。
+- **Agent 职责收紧**：`ChapterPlannerAgent` 是唯一章节规划讨论 Agent；Writing/Continuity/Review/Revision 处理场景执行，ChapterReview 处理章节审校，Aggregator 保持确定性聚合，CanonAgent 处理候选提取，均不扩展为聊天 Agent。
 
 ## 已完成产出
 
@@ -58,6 +64,10 @@
 - 修复 Worker 章节契约装配、Provider 有限重试和 `max_tokens` 截断问题；补充对应的单元、运行时和真实模型门控测试。
 - 新增章节计划初始化 API 与前端“生成章节计划”入口，打通新建章节后的 accepted plan 前置流程。
 - 形成二阶章节工作台设计文档，明确自然语言意图起步、同一 Planner 多轮讨论、作者确认后冻结契约，以及后续输入契约/提示词/Hook/测试/UI 的实现顺序。
+- 根据现有代码逐个核对 Writing、Continuity、Review、Revision、ChapterPlanner、ChapterReview 和 CanonAgent 的实际字段读取，确认 `scene_brief`、作者反馈、正文基线、版本指针和 `canon_scope` 的真实使用边界。
+- 更新二阶设计文档，新增 Planner 输入/提示词/`PlannerDiscussionHook` 实施任务、Agent 职责收紧与复用边界、共享信封字段投影表、字段泄漏测试、影响边界和兼容迁移规则。
+- 完成 Git 仓库初始化与 GitHub 远程仓库配置，远程地址为 `https://github.com/Alex-eng-ux/vible-writing-new.git`；整理 `.gitignore`，排除 `.env`、缓存、`node_modules`、日志、`egg-info` 和 `.trae` 等生成或敏感文件。
+- 完成本地首个提交、与远程 README 初始提交的合并，并将 `main` 成功推送到 GitHub；当前本地 `main` 跟踪远程 `main`。
 
 ## 验证结果
 
@@ -73,6 +83,10 @@
 - 二阶设计文档已按用户要求压缩：从 402 行/27143 字节降为 267 行/14033 字节；保留 11 个章节结构、端到端主流程、接口迁移边界、状态读取模型、阶段交付和验收；UTF-8 回读、10 项关键要求和占位符检查通过。
 - 随后按用户反馈恢复二阶设计文档完整版本：当前 406 行/27394 字节，保留完整前后端交付目标、状态读取模型、接口迁移边界、前端组件、阶段交付、主流程验收、回归验收和风险取舍；UTF-8 回读、12 项关键要求和占位符检查通过。
 - 当前代码核对结果：`CHAPTER_PLAN_SYSTEM_PROMPT` 只声明 `ChapterPlanOutput` JSON 字段，没有自然语言意图/可选字段/建议确认规则；`AgentInputEnvelope` 没有独立 `chapter_intent` 或讨论历史；章节图虽将 `author_feedback` 放入 envelope，但 `ChapterPlannerAgent._build_prompt()` 当前未把该反馈加入模型 prompt；现有测试只覆盖整个 `chapter_contract` 缺失时的澄清，不覆盖多轮规划对话。
+- 本轮 Agent 字段核对为文档级验证：`WritingAgent` 当前读取 `scene_brief`、`accepted_text` 和作者反馈；`RevisionAgent` 读取场景基线和作者反馈；Continuity/Review 主要读取正文和来源；CanonAgent 校验 `canon_scope` 与对应 accepted revision；Planner/ChapterReview 读取 `chapter_contract`。字段投影适配尚未实现。
+- 二阶设计文档新增内容已完成 UTF-8 回读和关键条目检查；本轮仍未运行应用测试，因为没有应用代码变更。
+- Git 验证结果：提交历史包含本地首个提交 `67b0003`、远程初始提交 `c8243b7` 和已推送的合并提交 `ff89a72`；`git status --short --branch` 显示 `main...Alex-eng-ux/vible-writing-new/main`，确认本地与远程同步。
+- 本轮 Git 操作只涉及仓库元数据、`.gitignore` 和开发日志；未重新运行应用测试，已有应用测试结论未因本轮 Git 操作改变。
 
 ## 当前不足与风险
 
@@ -88,6 +102,10 @@
 | 现有 Planner 提示词测试只校验 JSON/schema 字段与非法响应 | 即使测试全绿，也不能证明自然语言意图、多轮问答、建议确认行为成立 | 已通过 `test_prompt_contracts.py`、`test_chapter_agents_provider.py` 核对发现；需新增行为测试 |
 | 二阶计划书曾存在产品目标、工程接口、迁移策略和回归要求重复混排 | 精简版虽然降低篇幅，但用户认为它削弱了完整前后端交付目标 | 已先压缩为 267 行，后按用户反馈恢复为 406 行完整工程交接版 |
 | “场景自动生成”的放行语义仍需在实现前固定 | 主流程要求按计划顺序自动生成，作者逐场查看、反馈和接受；Worker 的推进门控必须与该交互一致 | 压缩版计划书已明确语义；待实现阶段用状态和测试固定 |
+| `.vs/` 目录仍为未跟踪项 | 后续提交可能误带入 Visual Studio 本地状态文件，造成仓库噪声 | `git status --short --branch` 已确认；本轮未修改 `.vs/` 或 `.gitignore`，待后续决定是否加入忽略规则 |
+| 共享信封当前没有 Agent 字段投影层 | 新增 Planner 讨论字段后，若直接沿用完整信封传给所有 Agent，可能造成 Prompt 污染、职责越界或旧调用回归 | 已通过现有源码核对发现；计划书已定义投影边界，但代码尚未实现 |
+| 当前场景 Agent 对 `scene_brief` 的 Prompt 使用不一致 | WritingAgent 已读取 `scene_brief`，Continuity/Review/Revision 主要使用正文和来源；若不补服务端资格校验，场景执行可能无法严格绑定 accepted plan | 已通过 Agent 源码核对发现；待字段投影和场景版本绑定实现/测试 |
+| Planner 专属 Prompt/Hook 尚未落地 | 当前 Planner 仍以 `chapter_contract` 为空作为主要澄清条件，无法完成多轮意图讨论和建议确认 | 设计任务已写入计划书；应用代码和行为测试尚未实现 |
 
 ## 当前未完成事项与下一步
 
@@ -100,3 +118,6 @@
 7. 真实模型时序非确定性已由门控测试以关键不变量覆盖；Provider 失败自动重试的退避/次数参数配置化仍可作为后续增强。
 8. 本次交接以二阶章节规划设计文档为实现基线：下一轮先落实 Planner 的输入契约、提示词与专属 Hook，再补多轮对话/反馈恢复/建议确认测试，最后进入章节工作台 UI；本轮日志补记没有改变应用代码，应用测试仍未重跑。
 9. 二阶计划书曾按用户意见完成压缩，但用户随后确认精简版偏离初衷；已恢复完整工程交接版，保留端到端主流程并恢复前后端目标、状态、接口、前端、阶段交付、验收和风险章节；本轮仍只修改文档，不修改应用代码。
+10. GitHub 发布已完成，后续提交前需评估 `.vs/` 是否加入 `.gitignore`；当前应用功能开发和测试仍按二阶章节工作台计划推进。
+11. 已根据现有 Agent 源码校对并修正计划书字段适配：下一步先实现共享信封到 Planner/场景图/章节审校/Canon 图的最小字段投影，再实现 Planner Prompt、`_build_prompt()` 和 `PlannerDiscussionHook`，禁止把讨论上下文扩散到其他 Agent。
+12. 计划书新增的职责收紧、字段投影和兼容迁移规则目前只有文档级验证；完成这些设计实现后，必须补字段泄漏、旧构造兼容、Planner 多轮恢复和完整章节工作流测试。

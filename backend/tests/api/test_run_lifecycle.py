@@ -51,7 +51,12 @@ def sse_base_url() -> Iterator[str]:
 
 
 def _create_run(client, chapter_id: str, key: str, **overrides) -> dict:
-    body = {"run_scope": "chapter", "request_type": "new_chapter", "decision_target": "plan"}
+    body = {
+        "run_scope": "chapter",
+        "request_type": "new_chapter",
+        "decision_target": "plan",
+        "chapter_intent": {"text": "intent"},
+    }
     body.update(overrides)
     resp = client.post(
         f"/api/chapters/{chapter_id}/runs",
@@ -60,6 +65,45 @@ def _create_run(client, chapter_id: str, key: str, **overrides) -> dict:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+def test_first_plan_accept_api_allows_missing_current_pointer(client, db):
+    project = _create_project(client)
+    volume = _create_volume(client, project["id"])
+    chapter = _create_chapter(client, volume["id"])
+    run = _create_run(
+        client,
+        chapter["id"],
+        "first-plan-api",
+        chapter_intent={"text": "A storm reveals a hidden clue."},
+    )
+    plan = create_chapter_plan_revision(
+        db,
+        chapter["id"],
+        None,
+        {"scenes": []},
+        "planner candidate",
+        {"actor_id": "planner", "idempotency_key": "first-plan-seed"},
+    )
+    db.get(GenerationRun, run["run_id"]).status = "waiting_feedback"
+    db.commit()
+
+    response = client.post(
+        f"/api/runs/{run['run_id']}/decisions",
+        json={
+            "idempotency_key": "first-plan-accept",
+            "expected_run_version": 1,
+            "target": "plan",
+            "decision": "accept",
+            "plan_revision_id": plan.id,
+            "expected_plan_version": 1,
+        },
+        headers={"Idempotency-Key": "first-plan-accept"},
+    )
+    assert response.status_code == 200, response.text
+    workflow = client.get(f"/api/chapters/{chapter['id']}/workflow")
+    assert workflow.status_code == 200, workflow.text
+    assert workflow.json()["plan"]["accepted_revision_id"] == plan.id
 
 
 def _decision_body(key: str, expected_run_version: int = 1, decision: str = "cancel") -> dict:
@@ -450,7 +494,12 @@ def test_cross_chapter_entry_validation(client, db):
     handoff_id = _seed_cross_handoff(db, rev1_id, chapter2["id"])
 
     def _run_for(chapter_id: str, key: str, **overrides):
-        body = {"run_scope": "chapter", "request_type": "new_chapter", "decision_target": "plan"}
+        body = {
+            "run_scope": "chapter",
+            "request_type": "new_chapter",
+            "decision_target": "plan",
+            "chapter_intent": {"text": "intent"},
+        }
         body.update(overrides)
         return client.post(
             f"/api/chapters/{chapter_id}/runs",
@@ -629,3 +678,50 @@ def test_decision_state_restrictions(client, db):
     r = _accept("st-accept3")
     assert r.status_code == 200, r.text
     assert r.json()["run"]["status"] == "accepted"
+
+
+def test_plan_feedback_child_supersedes_parent_only(client, db):
+    project = _create_project(client)
+    volume = _create_volume(client, project["id"])
+    chapter = _create_chapter(client, volume["id"])
+    plan = create_chapter_plan_revision(
+        db,
+        chapter["id"],
+        None,
+        {"scenes": []},
+        "seed",
+        {"actor_id": "planner", "idempotency_key": "feedback-plan"},
+    )
+    accept_chapter_plan_revision(
+        db,
+        chapter["id"],
+        plan.id,
+        None,
+        1,
+        {"actor_id": "planner", "idempotency_key": "feedback-accept"},
+    )
+    db.commit()
+    run = _create_run(client, chapter["id"], "feedback-run", plan_revision_id=plan.id)
+    parent = db.get(GenerationRun, run["run_id"])
+    parent.status = "waiting_feedback"
+    db.commit()
+
+    response = client.post(
+        f"/api/runs/{parent.id}/decisions",
+        json={
+            "idempotency_key": "feedback-decision",
+            "expected_run_version": 1,
+            "target": "plan",
+            "decision": "feedback",
+            "text": "revise the plan",
+        },
+        headers={"Idempotency-Key": "feedback-decision"},
+    )
+    assert response.status_code == 200, response.text
+    child_id = response.json()["run"]["run_id"]
+    child = db.get(GenerationRun, child_id)
+    db.refresh(parent)
+    assert child.parent_generation_run_id == parent.id
+    assert child.supersedes_run_id == parent.id
+    assert parent.status == "superseded"
+    assert parent.supersedes_run_id is None

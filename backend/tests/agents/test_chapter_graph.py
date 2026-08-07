@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from app.agents.chapter_graph import ChapterGraph
 from app.agents.hook_registry import HookRegistry
 from app.agents.result_router import AgentResultRouter
 from app.agents.schemas import AgentInputEnvelope, RuntimeContext
+from app.errors import AppError
 
 
 def _envelope(chapter_id: str | None = "ch1", **overrides: object) -> AgentInputEnvelope:
@@ -55,6 +59,66 @@ def test_chapter_graph_compiles_and_runs_plan_review_aggregate():
     assert result["last_durable_node"] in ("chapter_planner", "chapter_review", "chapter_aggregator")
 
 
+def test_chapter_review_run_aggregates_before_review():
+    """场景队列完成后的章节运行必须先聚合，再调用章节审校 Agent。"""
+    calls: list[str] = []
+
+    class _Aggregator:
+        def eligibility(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(eligible=True, reason="", status="ready")
+
+        def aggregate(self, *args: object, **kwargs: object) -> str:
+            calls.append("aggregate")
+            return "staged-chapter-revision"
+
+    class _Planner:
+        def run(self, envelope: AgentInputEnvelope) -> object:
+            raise AssertionError("chapter review run must not invoke planner")
+
+    class _Review:
+        def run(self, envelope: AgentInputEnvelope) -> object:
+            calls.append("review")
+            return SimpleNamespace(
+                status="ready",
+                review_issues=[],
+                overall_rating="pass",
+                submitted=True,
+                clarification_questions=[],
+                model_dump=lambda: {
+                    "status": "ready",
+                    "review_issues": [],
+                    "overall_rating": "pass",
+                    "submitted": True,
+                    "clarification_questions": [],
+                },
+            )
+
+    graph = ChapterGraph(
+        registry=HookRegistry(),
+        router=AgentResultRouter(),
+        planner=_Planner(),
+        review=_Review(),
+        aggregator=_Aggregator(),
+    )
+    envelope = _envelope(
+        "ch1",
+        request_type="review",
+        runtime_context=RuntimeContext(
+            generation_run_id="g-review",
+            agent_run_id="a-review",
+            agent_attempt_key="k-review",
+            thread_id="t-review",
+            run_scope="chapter",
+            decision_target="chapter",
+            chapter_id="ch1",
+        ),
+    )
+    result = graph.invoke(_state(), envelope, thread_id="t-review")
+
+    assert calls == ["aggregate", "review"]
+    assert result["last_durable_node"] == "chapter_review"
+
+
 def test_chapter_graph_checkpoint_resume():
     graph = ChapterGraph(
         registry=HookRegistry(),
@@ -82,11 +146,50 @@ def test_chapter_graph_step_planner_and_review():
         router=AgentResultRouter(),
     )
     state = _state()
-    envelope = _envelope("ch1")
-    plan = graph.step(state, envelope, "chapter_planner")
+    planning_envelope = _envelope("ch1", request_type="new_chapter")
+    plan = graph.step(state, planning_envelope, "chapter_planner")
     assert plan["last_durable_node"] == "chapter_planner"
-    review = graph.step(state, envelope, "chapter_review")
+    review_envelope = _envelope(
+        "ch1",
+        request_type="review",
+        runtime_context=RuntimeContext(
+            generation_run_id="g-review-step",
+            agent_run_id="a-review-step",
+            agent_attempt_key="k-review-step",
+            thread_id="t-review-step",
+            run_scope="chapter",
+            decision_target="chapter",
+            chapter_id="ch1",
+        ),
+    )
+    review = graph.step(state, review_envelope, "chapter_review")
     assert review["last_durable_node"] == "chapter_review"
+
+
+def test_new_chapter_cannot_directly_step_into_chapter_review():
+    """普通 new_chapter 规划不得通过旧图适配器直接执行章节审校。"""
+    graph = ChapterGraph(
+        registry=HookRegistry(),
+        router=AgentResultRouter(),
+    )
+    with pytest.raises(AppError, match="chapter review requires a chapter review run"):
+        graph.step(_state(), _envelope("ch1"), "chapter_review")
+
+
+def test_chapter_router_does_not_expose_legacy_downstream_nodes():
+    """章节 Planner/Review 的路由结果交给 workflow controller，而不是旧静态下游。"""
+    planner = AgentResultRouter().route(
+        SimpleNamespace(status="ready"),
+        "chapter_planner",
+        "chapter_planner",
+    )
+    review = AgentResultRouter().route(
+        SimpleNamespace(status="ready"),
+        "chapter_review",
+        "chapter_review",
+    )
+    assert planner.next_node != "chapter_review"
+    assert review.next_node != "chapter_aggregator"
 
 
 def test_chapter_graph_resume_accept_returns_to_pending_node():
@@ -98,16 +201,16 @@ def test_chapter_graph_resume_accept_returns_to_pending_node():
     first = graph.invoke(_state(), _envelope("ch1", chapter_contract={}), thread_id="t-accept")
     assert first["run_status"] == "paused"
     assert first["pending_node"] == "chapter_planner"
-    # accept 后回到 planner（pending_node），同一次 resume 就继续到审校及之后。
+    # accept 只结束本次候选规划图；场景队列由 workflow controller 接管。
     result = graph.invoke(
         _state(),
         _envelope("ch1", chapter_contract={"pov": "p", "scene_keys": ["s1", "s2"]}),
         thread_id="t-accept",
         resume={"action": "accept"},
     )
-    # 已离开 planner 暂停，进入审校分支（继续到聚合，未接聚合器时在聚合节点暂停）。
-    assert result["last_durable_node"] in ("chapter_review", "chapter_aggregator")
-    assert result["run_status"] == "paused"
+    assert result["last_durable_node"] == "chapter_planner"
+    assert result["run_status"] == "running"
+    assert result["pending_node"] is None
 
 
 def test_chapter_graph_resume_feedback_carries_author_feedback_and_reexecutes():

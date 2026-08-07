@@ -59,10 +59,10 @@ class AgentResultRouter:
             return self._route_review(output, pending_node)
         if agent_type == "revision":
             return self._route_revision(output, pending_node)
-        if agent_type == "chapter_planner":
-            return RouterOutcome(status="continue", next_node="chapter_review")
-        if agent_type == "chapter_review":
-            return RouterOutcome(status="continue", next_node="chapter_aggregator")
+        if agent_type in ("chapter_planner", "chapter_review"):
+            # 章节主流程由 workflow controller 根据 accepted plan/场景队列驱动。
+            # Router 只报告 Agent 已完成，不能暴露旧的 Planner -> Review -> Aggregator 直连边。
+            return RouterOutcome(status="continue")
         if agent_type == "canon":
             # Task 4C：CanonAgent 输出归一化后进入作者逐条确认（canon_confirmation），
             # 只有作者确认后才由正式提交节点写正式 Canon。

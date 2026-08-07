@@ -18,6 +18,7 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   reporter: [["list"]],
+  projects: [{ name: "chromium", use: { browserName: "chromium" } }],
   use: {
     baseURL: "http://127.0.0.1:3000",
     trace: "retain-on-failure",
@@ -37,6 +38,33 @@ export default defineConfig({
         API_BIND_SCOPE: "loopback",
         INTERNAL_API_BASE_URL: "http://127.0.0.1:8000",
         APP_ENV: "development",
+      },
+    },
+    {
+      // Worker 与 API 共用 E2E_DATABASE_URL；Worker 使用独立探针端口，避免
+      // Playwright 把 API 的 8000/ready 误判为 Worker 已经启动。
+      command: ".venv\\Scripts\\python.exe -m app.e2e_worker",
+      cwd: "./../backend",
+      url: "http://127.0.0.1:8001/ready",
+      reuseExistingServer: false,
+      timeout: 60_000,
+      env: {
+        DATABASE_URL: "postgresql+psycopg://postgres:postgres@localhost:5432/novel_e2e",
+        ACTOR_ID: "e2e-worker",
+        DEPLOYMENT_MODE: "single_user_private",
+        API_BIND_SCOPE: "loopback",
+        INTERNAL_API_BASE_URL: "http://127.0.0.1:8000",
+        APP_ENV: "development",
+        E2E_WORKER_READY_PORT: "8001",
+        LLM_BASE_URL: "",
+        LLM_API_KEY: "",
+        MODEL_NAME: "",
+        LANGSMITH_TRACING: "false",
+        LANGSMITH_API_KEY: "",
+        LANGSMITH_PROJECT: "",
+        LANGSMITH_CAPTURE_CONTENT: "false",
+        E2E_WORKER_AUTO_PLAN_EXECUTION: "false",
+        E2E_WORKER_PROCESS_QUEUED_RUNS: "false",
       },
     },
     {

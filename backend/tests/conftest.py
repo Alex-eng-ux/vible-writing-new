@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.db import session as db_session
@@ -40,6 +40,15 @@ def db():
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     s = factory()
     try:
+        # Worker 测试会在独立会话提交运行、计划映射和 outbox；每个测试开始前
+        # 清理这些跨会话副作用，避免旧 accepted plan 重新驱动当前测试队列。
+        s.execute(text("DELETE FROM run_outbox_records"))
+        s.execute(text("DELETE FROM run_events"))
+        s.execute(text("DELETE FROM run_decisions"))
+        s.execute(text("DELETE FROM generation_runs"))
+        s.execute(text("DELETE FROM chapter_plan_scene_links"))
+        s.execute(text("DELETE FROM chapter_plan_revision_links"))
+        s.commit()
         yield s
     finally:
         s.rollback()

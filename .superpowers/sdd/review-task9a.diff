@@ -1,0 +1,962 @@
+﻿# Review package: Task 9A working tree vs HEAD
+
+## Tracked diff stat
+ frontend/src/app/page.tsx     | 338 +++++++++++++++++++++++++++++++++++-------
+ frontend/src/services/api.ts  |  32 ++--
+ frontend/src/types/index.ts   |  77 ++++++++--
+ frontend/tests/editor.spec.ts |  25 +++-
+ 4 files changed, 388 insertions(+), 84 deletions(-)
+
+## Tracked diff
+diff --git a/frontend/src/app/page.tsx b/frontend/src/app/page.tsx
+index 38c38ec..b1256dd 100644
+--- a/frontend/src/app/page.tsx
++++ b/frontend/src/app/page.tsx
+@@ -16,48 +16,48 @@ import type { Editor } from "@tiptap/react";
+ 
+ import DiffView from "@/features/editor/DiffView";
+ import ManuscriptEditor from "@/features/editor/ManuscriptEditor";
+ import RunPanel from "@/features/runs/RunPanel";
+ import StoryBiblePanel from "@/features/storybible/StoryBiblePanel";
+ import {
+   ApiError,
+   commitChangeSet,
+   createChangeSet,
+   createChapter,
+-  createChapterPlan,
++  createChapterRun,
+   createIdempotencyKey,
+   createProject,
+   createScene,
+   createSceneRun,
+   createVolume,
+   deleteChapter,
+   deleteProject,
+   deleteScene,
+   deleteSceneRevision,
+   deleteVolume,
+-  getChapterPlan,
++  getChapterWorkflow,
+   getRun,
+   getSceneRevisionDetail,
+   listChapters,
+   listProjects,
+   listSceneRevisions,
+   listScenes,
+   listVolumes,
+   prosemirrorToText,
+   resumeRun,
+   rollbackScene,
+   submitRunDecision,
+ } from "@/services/api";
+ import { connectRunEvents, type SseEvent } from "@/services/sse";
+ import type {
+   Chapter,
+-  ChapterPlan,
++  ChapterWorkflowRead,
+   Project,
+   ReviewIssueItem,
+   RunSnapshot,
+   Scene,
+   SceneRevision,
+   SceneRevisionDetail,
+   Volume,
+ } from "@/types";
+ 
+ type TreeNode = {
+@@ -77,22 +77,25 @@ type DeleteTarget =
+   | { kind: "project"; id: string; name: string }
+   | { kind: "volume"; id: string; name: string; projectId: string }
+   | { kind: "chapter"; id: string; name: string; projectId: string; volumeId: string }
+   | { kind: "scene"; id: string; name: string; projectId: string; volumeId: string; chapterId: string }
+   | { kind: "revision"; id: string; name: string; sceneId: string };
+ 
+ export default function Home() {
+   const [projects, setProjects] = useState<Project[]>([]);
+   const [tree, setTree] = useState<Record<string, TreeNode>>({});
+   const [selectedScene, setSelectedScene] = useState<Scene | null>(null);
++  const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
++  const [chapterWorkflow, setChapterWorkflow] = useState<ChapterWorkflowRead | null>(null);
++  const [chapterIntentDraft, setChapterIntentDraft] = useState("");
++  const [plannerFeedback, setPlannerFeedback] = useState("");
+   const [revisions, setRevisions] = useState<SceneRevision[]>([]);
+-  const [chapterPlans, setChapterPlans] = useState<Record<string, ChapterPlan | null>>({});
+   const [acceptedDetail, setAcceptedDetail] = useState<SceneRevisionDetail | null>(null);
+   const [localText, setLocalText] = useState<string>("");
+   const [status, setStatus] = useState<string>("");
+   const [busy, setBusy] = useState(false);
+   const [conflict, setConflict] = useState<ConflictState>(null);
+   const [deleteMenu, setDeleteMenu] = useState<{ x: number; y: number; target: DeleteTarget } | null>(null);
+ 
+   // 版本比较选择。
+   const [cmpLeftId, setCmpLeftId] = useState<string>("");
+   const [cmpRightId, setCmpRightId] = useState<string>("");
+@@ -310,48 +313,20 @@ export default function Home() {
+       setNewSceneTitle("");
+       await loadScenes(projectId, volumeId, chapterId);
+       setStatus(`已创建场景 ${title}`);
+     } catch (e) {
+       setStatus(errorMessage(e));
+     } finally {
+       setBusy(false);
+     }
+   }
+ 
+-  /** 初始化并接受章节计划（幂等命令）：使该章节下的场景续写/改写/审校可用。 */
+-  async function handleCreateChapterPlan(projectId: string, volumeId: string, chapterId: string) {
+-    if (busy) return;
+-    setBusy(true);
+-    setStatus("");
+-    try {
+-      const key = createIdempotencyKey("chapter_plan_init", chapterId);
+-      const plan = await createChapterPlan(chapterId, key);
+-      setChapterPlans((prev) => ({ ...prev, [chapterId]: plan }));
+-      setStatus(
+-        plan.plan_revision_id
+-          ? `章节计划已就绪（${plan.plan_status}）`
+-          : "章节计划初始化失败",
+-      );
+-      await loadVolumes(projectId);
+-      await loadChapters(projectId, volumeId);
+-    } catch (e) {
+-      if (e instanceof ApiError && e.code === "CONTEXT_SOURCE_UNAVAILABLE") {
+-        setStatus("当前章节已不存在，请重新展开项目和卷");
+-        await loadVolumes(projectId).catch(() => undefined);
+-        return;
+-      }
+-      setStatus(errorMessage(e));
+-    } finally {
+-      setBusy(false);
+-    }
+-  }
+-
+   // -------------------------------------------------------------------------
+   // 导航加载
+   // -------------------------------------------------------------------------
+ 
+   async function loadVolumes(projectId: string) {
+     const volumes = await listVolumes(projectId);
+     setTree((prev) => ({
+       ...prev,
+       [projectId]: { ...(prev[projectId] ?? emptyNode(projectId)), volumes },
+     }));
+@@ -470,25 +445,25 @@ export default function Home() {
+     setStatus("");
+     // 切换场景：清空运行状态机与 SSE 订阅（useEffect 依 run_id 自动断开）。
+     setActiveRun(null);
+     setRunEvents([]);
+     setRunIssues([]);
+     setPendingDraftId(null);
+     setPendingChangeSetId(null);
+     seenEventIds.current.clear();
+     setSelectedText("");
+     try {
+-      const [revs, plan] = await Promise.all([
++      const [revs, workflow] = await Promise.all([
+         listSceneRevisions(scene.id),
+-        getChapterPlan(scene.chapter_id),
++        getChapterWorkflow(scene.chapter_id),
+       ]);
+-      setChapterPlans((prev) => ({ ...prev, [scene.chapter_id]: plan }));
++      setChapterWorkflow(workflow);
+       const latest = revs[revs.length - 1] ?? null;
+       setRevisions(revs);
+       if (latest) {
+         const detail = await getSceneRevisionDetail(scene.id, latest.id);
+         setAcceptedDetail(detail);
+         setLocalText(prosemirrorToText(detail.content));
+         setCmpLeftId(revs[revs.length - 2]?.id ?? latest.id);
+         setCmpRightId(latest.id);
+       } else {
+         setAcceptedDetail(null);
+@@ -499,20 +474,132 @@ export default function Home() {
+     } catch (e) {
+       if (e instanceof ApiError && e.code === "CONTEXT_SOURCE_UNAVAILABLE") {
+         clearSelectedScene();
+         setStatus("当前章节已不存在，请重新展开项目和卷");
+         return;
+       }
+       setStatus(errorMessage(e));
+     }
+   }
+ 
++  async function loadChapterWorkflow(chapterId: string) {
++    const workflow = await getChapterWorkflow(chapterId);
++    setChapterWorkflow(workflow);
++    setChapterIntentDraft(workflow.intent.text);
++  }
++
++  async function selectChapter(chapterId: string) {
++    setSelectedChapterId(chapterId);
++    setSelectedScene(null);
++    setChapterWorkflow(null);
++    setStatus("");
++    try {
++      await loadChapterWorkflow(chapterId);
++    } catch (e) {
++      setStatus(errorMessage(e));
++    }
++  }
++
++  async function startChapterPlanning() {
++    if (!selectedChapterId || busy || !chapterIntentDraft.trim()) {
++      setStatus("请输入章节意图后再启动规划");
++      return;
++    }
++    setBusy(true);
++    try {
++      await createChapterRun(
++        selectedChapterId,
++        {
++          run_scope: "chapter",
++          request_type: "new_chapter",
++          decision_target: "plan",
++          chapter_intent: { text: chapterIntentDraft.trim() },
++        },
++        createIdempotencyKey("chapter_plan_run", selectedChapterId),
++      );
++      await loadChapterWorkflow(selectedChapterId);
++      setStatus("章节规划已启动");
++    } catch (e) {
++      setStatus(errorMessage(e));
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function submitChapterDecision(decision: "accept" | "feedback" | "cancel") {
++    if (!chapterWorkflow?.pending_decision.run_id || !selectedChapterId || busy) return;
++    const runId = chapterWorkflow.pending_decision.run_id;
++    const plan = chapterWorkflow.plan;
++    const key = createIdempotencyKey(`chapter_${decision}`, runId);
++    const target = chapterWorkflow.pending_decision.target === "chapter" ? "chapter" : "plan";
++    setBusy(true);
++    try {
++      await submitRunDecision(
++        runId,
++        {
++          idempotency_key: key,
++          expected_run_version: chapterWorkflow.pending_decision.expected_run_version ?? 0,
++          target,
++          decision,
++          text: decision === "feedback" ? plannerFeedback.trim() : undefined,
++          plan_revision_id: target === "plan" && decision === "accept" ? plan.candidate_revision_id ?? undefined : undefined,
++          expected_current_plan_revision_id: target === "plan" ? plan.accepted_revision_id : undefined,
++          expected_plan_version: target === "plan" ? plan.candidate_version : undefined,
++          chapter_revision_id: target === "chapter" && decision === "accept"
++            ? chapterWorkflow.chapter_revision.staged_revision_id ?? undefined
++            : undefined,
++        },
++        key,
++      );
++      setPlannerFeedback("");
++      await loadChapterWorkflow(selectedChapterId);
++      setStatus(decision === "accept" ? "计划已提交接受" : decision === "feedback" ? "反馈已提交" : "规划已取消");
++    } catch (e) {
++      setStatus(errorMessage(e));
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function startChapterReview() {
++    if (!selectedChapterId || busy || !chapterWorkflow?.plan.accepted_revision_id) return;
++    setBusy(true);
++    try {
++      await createChapterRun(
++        selectedChapterId,
++        {
++          run_scope: "chapter",
++          request_type: "review",
++          decision_target: "chapter",
++          plan_revision_id: chapterWorkflow.plan.accepted_revision_id,
++        },
++        createIdempotencyKey("chapter_review_run", selectedChapterId),
++      );
++      await loadChapterWorkflow(selectedChapterId);
++      setStatus("章节审校已启动");
++    } catch (e) {
++      setStatus(errorMessage(e));
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  useEffect(() => {
++    if (!selectedChapterId || !chapterWorkflow?.active_run) return;
++    const status = chapterWorkflow.active_run.status;
++    if (!["queued", "running"].includes(status)) return;
++    const timer = window.setInterval(() => {
++      void loadChapterWorkflow(selectedChapterId).catch((e) => setStatus(errorMessage(e)));
++    }, 1500);
++    return () => window.clearInterval(timer);
++  }, [selectedChapterId, chapterWorkflow?.active_run?.status, chapterWorkflow?.active_run?.run_id]);
++
+   /** 重新拉取场景列表与最新版本，返回最新 accepted detail（用于冲突恢复）。 */
+   async function refreshSceneLatest(): Promise<{ detail: SceneRevisionDetail | null; revs: SceneRevision[] }> {
+     if (!selectedScene) return { detail: null, revs: [] };
+     const revs = await listSceneRevisions(selectedScene.id);
+     setRevisions(revs);
+     const latest = revs[revs.length - 1] ?? null;
+     if (!latest) {
+       setAcceptedDetail(null);
+       setCmpLeftId("");
+       setCmpRightId("");
+@@ -545,33 +632,36 @@ export default function Home() {
+     }
+     if (!selection) selection = selectionOnMouseDownRef.current;
+     if (!selection) {
+       selection = window.getSelection()?.toString().trim() ?? "";
+     }
+     if (requestType !== "review" && !selection) {
+       setStatus("请先在编辑器中选择要续写/改写的文本");
+       return;
+     }
+     try {
+-      const plan = await getChapterPlan(selectedScene.chapter_id);
+-      if (!plan.plan_revision_id) {
+-        setStatus("章节尚无 accepted plan，请先点击章节旁的「生成章节计划」");
++      // 运行前重新读取权威工作流快照，避免 accepted plan 或队列阻断状态在缓存后发生变化。
++      const workflow = await getChapterWorkflow(selectedScene.chapter_id);
++      setChapterWorkflow(workflow);
++      const acceptedPlanRevisionId = workflow.plan.accepted_revision_id;
++      if (!acceptedPlanRevisionId) {
++        setStatus("章节尚无 accepted plan，请先完成章节规划并接受计划");
+         return;
+       }
+       const key = createIdempotencyKey("scene_run", selectedScene.id);
+       const run = await createSceneRun(
+         selectedScene.id,
+         {
+           run_scope: "scene",
+           request_type: requestType,
+           decision_target: "scene",
+-          plan_revision_id: plan.plan_revision_id,
++          plan_revision_id: acceptedPlanRevisionId,
+           base_scene_revision_id: selectedScene.accepted_scene_revision_id,
+           ...(selection ? { author_feedback: { text: selection } } : {}),
+         },
+         key,
+       );
+       // 新运行：清空事件/审校问题/物化定位，挂载 SSE。
+       seenEventIds.current.clear();
+       setRunEvents([]);
+       setRunIssues([]);
+       setPendingDraftId(null);
+@@ -868,38 +958,76 @@ export default function Home() {
+       setStatus(errorMessage(e));
+     } finally {
+       setBusy(false);
+     }
+   }
+ 
+   function shortId(id: string): string {
+     return id.slice(0, 8);
+   }
+ 
++  function phaseLabel(phase: ChapterWorkflowRead["phase"]): string {
++    const labels: Record<ChapterWorkflowRead["phase"], string> = {
++      intent_required: "需要章节意图",
++      planning: "规划中",
++      plan_feedback: "计划待决策",
++      scene_generation: "场景生成中",
++      scene_feedback: "场景待反馈",
++      chapter_review: "章节待审校",
++      chapter_feedback: "章节待反馈",
++      canon_feedback: "Canon 待决策",
++      completed: "已完成",
++      blocked: "已阻断",
++    };
++    return labels[phase];
++  }
++
+   const sortedRevisions = useMemo(() => [...revisions].reverse(), [revisions]);
+   const selectedSceneBrief = selectedScene?.scene_brief ?? null;
+-  const selectedChapterPlan = selectedScene ? chapterPlans[selectedScene.chapter_id] : null;
+-  const planScenes = selectedChapterPlan?.chapter_contract?.scenes ?? [];
++  const selectedChapterWorkflow =
++    selectedScene && chapterWorkflow?.chapter_id === selectedScene.chapter_id ? chapterWorkflow : null;
++  const selectedPlan = selectedChapterWorkflow?.plan ?? null;
++  const selectedPlanRevisionId =
++    selectedPlan?.status === "candidate"
++      ? selectedPlan.candidate_revision_id
++      : selectedPlan?.accepted_revision_id ?? selectedPlan?.candidate_revision_id;
++  const selectedPlanVersion =
++    selectedPlan?.status === "candidate"
++      ? selectedPlan.candidate_version
++      : selectedPlan?.accepted_version ?? selectedPlan?.candidate_version;
++  const selectedPlanOutline =
++    typeof selectedPlan?.contract?.outline === "string" ? selectedPlan.contract.outline : null;
++  const planScenes = selectedPlan?.scene_briefs ?? [];
+ 
+   // Task 7C：从导航树定位当前场景所属项目与章节（Story Bible 目标）。
+   const sceneChapter = useMemo(() => {
+     if (!selectedScene) return null;
+     for (const [pid, node] of Object.entries(tree)) {
+       for (const volume of node.volumes ?? []) {
+         const chapter = (node.chapters[volume.id] ?? []).find(
+           (c) => c.id === selectedScene.chapter_id,
+         );
+         if (chapter) return { projectId: pid, chapter };
+       }
+     }
+     return null;
+   }, [selectedScene, tree]);
++  const selectedChapterContext = useMemo(() => {
++    if (!selectedChapterId) return null;
++    for (const [projectId, node] of Object.entries(tree)) {
++      for (const volume of node.volumes ?? []) {
++        const chapter = (node.chapters[volume.id] ?? []).find((c) => c.id === selectedChapterId);
++        if (chapter) return { projectId, chapter };
++      }
++    }
++    return null;
++  }, [selectedChapterId, tree]);
+ 
+   return (
+     <main className="workspace">
+       <header className="workspace-header">
+         <h1>Novel Studio — 写作工作台</h1>
+         <span className="status-message" data-testid="status-message">{status || "\u00a0"}</span>
+       </header>
+ 
+       <div className="workspace-body">
+         {/* 左侧：导航树 */}
+@@ -922,20 +1050,21 @@ export default function Home() {
+                 const node = tree[project.id];
+                 return (
+                   <li key={project.id} className="tree-item">
+                     <div
+                       className="tree-label"
+                       onContextMenu={(event) => openDeleteMenu(event, { kind: "project", id: project.id, name: project.name })}
+                     >
+                       <span>📁 {project.name}</span>
+                       <button
+                         onClick={() => void toggleProject(project.id)}
++                        data-testid={`project-toggle-${project.id}`}
+                         className="tree-action"
+                         disabled={busy}
+                       >
+                         {node?.volumes ? "收起" : "展开"}
+                       </button>
+                     </div>
+                     {node?.volumes && (
+                       <ul className="tree">
+                         <li className="tree-item">
+                           <div className="inline-form compact">
+@@ -959,20 +1088,21 @@ export default function Home() {
+                                   kind: "volume",
+                                   id: volume.id,
+                                   name: volume.name,
+                                   projectId: project.id,
+                                 })
+                               }
+                             >
+                               <span>📖 {volume.name}</span>
+                               <button
+                                 onClick={() => void toggleVolume(project.id, volume.id)}
++                                data-testid={`volume-toggle-${volume.id}`}
+                                 className="tree-action"
+                                 disabled={busy}
+                               >
+                                 {node?.chapters[volume.id] ? "收起" : "展开"}
+                               </button>
+                             </div>
+                             {node.chapters[volume.id] && (
+                               <ul className="tree">
+                                 <li className="tree-item">
+                                   <div className="inline-form compact">
+@@ -999,25 +1129,26 @@ export default function Home() {
+                                           kind: "chapter",
+                                           id: chapter.id,
+                                           name: chapter.title,
+                                           projectId: project.id,
+                                           volumeId: volume.id,
+                                         })
+                                       }
+                                     >
+                                       <span>📃 {chapter.title}</span>
+                                       <button
+-                                        onClick={() => void handleCreateChapterPlan(project.id, volume.id, chapter.id)}
++                                        onClick={() => void selectChapter(chapter.id)}
++                                        data-testid={`chapter-item-${chapter.id}`}
+                                         className="tree-action"
+                                         disabled={busy}
+                                       >
+-                                        生成章节计划
++                                        打开章节工作台
+                                       </button>
+                                       <button
+                                         onClick={() => void toggleChapter(project.id, volume.id, chapter.id)}
+                                         className="tree-action"
+                                         disabled={busy}
+                                       >
+                                         {node?.scenes[chapter.id] ? "收起" : "展开"}
+                                       </button>
+                                     </div>
+                                     {node.scenes[chapter.id] && (
+@@ -1080,48 +1211,48 @@ export default function Home() {
+         </aside>
+ 
+         {/* 中间：编辑器 */}
+         <section className="editor-pane" data-testid="editor-pane">
+           {selectedScene ? (
+             <>
+               <h2>场景：{selectedScene.title}</h2>
+               <section className="chapter-plan-panel" data-testid="chapter-plan-panel">
+                 <div className="chapter-plan-heading">
+                   <h3>章节计划</h3>
+-                  {selectedChapterPlan?.plan_revision_id && (
+-                    <span>v{selectedChapterPlan.plan_version ?? "?"} · {selectedChapterPlan.plan_status}</span>
++                  {selectedPlanRevisionId && (
++                    <span>v{selectedPlanVersion ?? "?"} · {selectedPlan?.status}</span>
+                   )}
+                 </div>
+-                {selectedChapterPlan?.chapter_contract ? (
++                {selectedPlan?.contract ? (
+                   <>
+                     <p className="chapter-plan-outline">
+-                      {selectedChapterPlan.chapter_contract.outline || selectedChapterPlan.plan_reason || "暂无大纲说明"}
++                      {selectedPlanOutline || "暂无大纲说明"}
+                     </p>
+                     {planScenes.length > 0 ? (
+                       <ol className="chapter-plan-scenes">
+                         {planScenes.map((planScene, index) => (
+-                          <li key={planScene.scene_id ?? `${index}-${planScene.title ?? "scene"}`}>
++                          <li key={planScene.client_key || `${index}-${planScene.title || "scene"}`}>
+                             <strong>{planScene.title || `场景 ${index + 1}`}</strong>
+-                            {planScene.scene_brief && (
+-                              <span>{JSON.stringify(planScene.scene_brief)}</span>
++                            {Object.keys(planScene.brief).length > 0 && (
++                              <span>{JSON.stringify(planScene.brief)}</span>
+                             )}
+                           </li>
+                         ))}
+                       </ol>
+                     ) : (
+                       <p className="chapter-plan-empty">当前计划还没有场景安排。</p>
+                     )}
+-                  </>
+-                ) : (
+-                  <p className="chapter-plan-empty">尚未生成章节计划，请点击左侧章节旁的按钮。</p>
+-                )}
+-              </section>
++                   </>
++                 ) : (
++                   <p className="chapter-plan-empty">尚未生成章节计划，请先完成章节规划流程。</p>
++                 )}
++               </section>
+               {/* Task 7B：选中片段续写/改写/审校 */}
+               <div className="run-create-actions" data-testid="run-create-actions">
+                 <button
+                   data-testid="btn-continue"
+                   onClick={() => void handleStartRun("continue")}
+                   onMouseDown={() => {
+                     selectionOnMouseDownRef.current = window.getSelection()?.toString().trim() ?? "";
+                   }}
+                   disabled={busy}
+                 >
+@@ -1173,27 +1304,124 @@ export default function Home() {
+                     <button data-testid="btn-conflict-override" onClick={() => void handleConflictOverride()} disabled={busy}>
+                       以我的文本覆盖提交
+                     </button>
+                     <button data-testid="btn-conflict-discard" onClick={handleConflictDiscard} disabled={busy}>
+                       丢弃我的更改
+                     </button>
+                   </div>
+                 </div>
+               )}
+             </>
++          ) : selectedChapterId ? (
++            <section className="chapter-workspace" data-testid="chapter-workspace">
++              {chapterWorkflow && (
++                <section className="chapter-review-actions" data-testid="chapter-review-actions">
++                  {chapterWorkflow.phase === "chapter_review" && chapterWorkflow.plan.accepted_revision_id && !chapterWorkflow.active_run && !chapterWorkflow.chapter_revision.staged_revision_id && (
++                    <button data-testid="btn-start-chapter-review" onClick={() => void startChapterReview()} disabled={busy}>
++                      启动章节审核
++                    </button>
++                  )}
++                  {(chapterWorkflow.pending_decision.kind === "accept_chapter" || chapterWorkflow.pending_decision.kind === "chapter_feedback") && (
++                    <>
++                      {chapterWorkflow.chapter_revision.review_issues.length > 0 && (
++                        <ul className="chapter-review-issues" data-testid="chapter-review-issues">
++                          {chapterWorkflow.chapter_revision.review_issues.map((issue) => (
++                            <li key={issue.local_key}><strong>{issue.severity}</strong> {issue.message}</li>
++                          ))}
++                        </ul>
++                      )}
++                      <textarea
++                        data-testid="chapter-review-feedback-input"
++                        value={plannerFeedback}
++                        onChange={(event) => setPlannerFeedback(event.target.value)}
++                        rows={3}
++                        placeholder="章节审核反馈"
++                      />
++                      {chapterWorkflow.pending_decision.kind === "accept_chapter" && chapterWorkflow.chapter_revision.staged_revision_id && (
++                        <button data-testid="btn-accept-chapter-revision" onClick={() => void submitChapterDecision("accept")} disabled={busy}>
++                          接受章节版本
++                        </button>
++                      )}
++                      <button data-testid="btn-chapter-review-feedback" onClick={() => void submitChapterDecision("feedback")} disabled={busy || !plannerFeedback.trim()}>
++                        提交审核反馈
++                      </button>
++                    </>
++                  )}
++                </section>
++              )}
++              <div className="chapter-workspace-heading">
++                <h2>章节工作台</h2>
++                {chapterWorkflow && <span data-testid="chapter-workflow-phase">{phaseLabel(chapterWorkflow.phase)}</span>}
++              </div>
++              {chapterWorkflow && (
++                <section className="chapter-canon-summary" data-testid="chapter-canon-summary">
++                  <div className="chapter-canon-heading">
++                    <h3>章节 Canon</h3>
++                    <span className="chapter-canon-status">{chapterWorkflow.canon.status ?? "尚未运行"}</span>
++                  </div>
++                  <dl className="chapter-canon-metrics">
++                    <div>
++                      <dt>来源版本</dt>
++                      <dd>{chapterWorkflow.canon.source_revision_id ? shortId(chapterWorkflow.canon.source_revision_id) : "暂无"}</dd>
++                    </div>
++                    <div>
++                      <dt>待决候选</dt>
++                      <dd>{chapterWorkflow.canon.pending_candidate_count}</dd>
++                    </div>
++                    <div>
++                      <dt>当前章节版本</dt>
++                      <dd>{chapterWorkflow.chapter_revision.accepted_revision_id ? shortId(chapterWorkflow.chapter_revision.accepted_revision_id) : "未接受"}</dd>
++                    </div>
++                  </dl>
++                </section>
++              )}
++              {!chapterWorkflow ? <p>正在读取章节状态...</p> : (
++                <>
++                  <label htmlFor="chapter-intent-input">章节意图</label>
++                  <textarea id="chapter-intent-input" data-testid="chapter-intent-input" value={chapterIntentDraft} onChange={(event) => setChapterIntentDraft(event.target.value)} rows={4} disabled={chapterWorkflow.phase !== "intent_required" || busy} />
++                  <div className="chapter-workflow-actions">
++                    {chapterWorkflow.phase === "intent_required" && <button data-testid="btn-start-chapter-planning" onClick={() => void startChapterPlanning()} disabled={busy}>启动章节规划</button>}
++                    {chapterWorkflow.pending_decision.kind === "answer_planner" && <><textarea data-testid="planner-feedback-input" value={plannerFeedback} onChange={(event) => setPlannerFeedback(event.target.value)} rows={3} placeholder="回答 Planner 的问题" /><button data-testid="btn-plan-feedback" onClick={() => void submitChapterDecision("feedback")} disabled={busy || !plannerFeedback.trim()}>提交反馈</button></>}
++                    {chapterWorkflow.pending_decision.kind === "accept_plan" && chapterWorkflow.plan.candidate_revision_id && <><button data-testid="btn-accept-chapter-plan" onClick={() => void submitChapterDecision("accept")} disabled={busy}>接受候选计划</button><textarea data-testid="planner-plan-feedback-input" value={plannerFeedback} onChange={(event) => setPlannerFeedback(event.target.value)} rows={2} placeholder="计划反馈（可选）" /><button data-testid="btn-plan-feedback" onClick={() => void submitChapterDecision("feedback")} disabled={busy || !plannerFeedback.trim()}>反馈并重新规划</button></>}
++                    {chapterWorkflow.pending_decision.run_id && chapterWorkflow.phase === "plan_feedback" && <button data-testid="btn-plan-cancel" onClick={() => void submitChapterDecision("cancel")} disabled={busy}>取消规划</button>}
++                  </div>
++                  {chapterWorkflow.blocking_reasons.length > 0 && <div className="chapter-workflow-blocked" role="alert"><strong>当前阻断</strong><ul>{chapterWorkflow.blocking_reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>}
++                  <section className="chapter-discussion" data-testid="chapter-plan-discussion" aria-live="polite"><h3>Planner 讨论</h3>{chapterWorkflow.plan_discussion.messages.length === 0 ? <p>暂无讨论记录。</p> : chapterWorkflow.plan_discussion.messages.map((message) => <p key={String(message.message_id)}><strong>{String(message.role ?? "")}</strong> {String(message.text ?? "")}</p>)}{chapterWorkflow.plan_discussion.pending_questions.map((question) => <p key={question.question_id}>待回答：{question.text}</p>)}</section>
++                  <section className="chapter-plan-candidate" data-testid="chapter-plan-candidate"><h3>计划候选</h3>{chapterWorkflow.plan.scene_briefs.length === 0 ? <p>尚未形成场景候选。</p> : <ol>{chapterWorkflow.plan.scene_briefs.map((brief) => <li key={brief.client_key}><strong>{brief.title}</strong><span>{Object.entries(brief.brief).map(([key, value]) => `${key}: ${String(value)}`).join("；")}</span></li>)}</ol>}</section>
++                  <section className="chapter-scene-queue" data-testid="chapter-scene-queue"><h3>场景队列</h3>{chapterWorkflow.scenes.length === 0 ? <p>接受计划后，场景会按顺序进入队列。</p> : <ol>{chapterWorkflow.scenes.map((scene) => <li key={scene.scene_id}>{scene.order + 1}. {scene.title} <span>{scene.status}</span></li>)}</ol>}</section>
++                </>
++              )}
++            </section>
+           ) : (
+             <div className="placeholder">从左侧选择一个场景开始编辑。</div>
+           )}
+         </section>
+ 
+         {/* 右侧：运行面板 + Story Bible + 版本历史 / 比较 / 回滚 */}
+         <aside className="history-pane" data-testid="history-pane">
++          {!selectedScene && selectedChapterContext && (
++            <StoryBiblePanel
++              target={{
++                projectId: selectedChapterContext.projectId,
++                scene: null,
++                chapter: {
++                  id: selectedChapterContext.chapter.id,
++                  title: selectedChapterContext.chapter.title,
++                  // 工作流快照是章节接受后的权威版本；导航树刷新存在异步窗口，不能继续使用旧指针。
++                  acceptedRevisionId: chapterWorkflow
++                    ? chapterWorkflow.chapter_revision.accepted_revision_id
++                    : selectedChapterContext.chapter.accepted_chapter_revision_id,
++                },
++              }}
++              onStatus={setStatus}
++            />
++          )}
+           {selectedScene && (
+             <>
+               {selectedScene && sceneChapter && (
+                 <StoryBiblePanel
+                   target={{
+                     projectId: sceneChapter.projectId,
+                     scene: {
+                       id: selectedScene.id,
+                       title: selectedScene.title,
+                       acceptedRevisionId: selectedScene.accepted_scene_revision_id,
+diff --git a/frontend/src/services/api.ts b/frontend/src/services/api.ts
+index f244918..95487f2 100644
+--- a/frontend/src/services/api.ts
++++ b/frontend/src/services/api.ts
+@@ -9,21 +9,21 @@
+  * - 统一解析后端 `ErrorEnvelope` 并抛出 `ApiError`，组件不得自行拼接请求。
+  */
+ 
+ import type {
+   CanonCandidateList,
+   CanonDecisionRequest,
+   CanonRunCreateRequest,
+   CanonSnapshot,
+   ChangeSetCreated,
+   Chapter,
+-  ChapterPlan,
++  ChapterWorkflowRead,
+   ChapterRevision,
+   DecisionResponse,
+   ErrorEnvelope,
+   Project,
+   ProseMirrorOp,
+   ResourceCreated,
+   RunSnapshot,
+   Scene,
+   SceneRevision,
+   SceneRevisionDetail,
+@@ -210,31 +210,41 @@ export const commitChangeSet = (changeSetId: string, key: string) =>
+ 
+ /** 回滚场景到显式目标父版本（author_decision=author）。 */
+ export const rollbackScene = (sceneId: string, targetRevisionId: string, key: string) =>
+   requestJson<SceneRevision>(`/api/scenes/${sceneId}/rollback`, {
+     method: "POST",
+     body: { target_revision_id: targetRevisionId, author_decision: "author" },
+     idempotencyKey: key,
+   });
+ 
+ // ---------------------------------------------------------------------------
+-// Task 7B：运行 / 决策 / 恢复 / plan
++// Task 7B：运行 / 决策 / 恢复 / workflow
+ // ---------------------------------------------------------------------------
+ 
+-/** 读取章节当前 accepted plan（只读；场景运行创建的前提）。 */
+-export const getChapterPlan = (chapterId: string) =>
+-  requestJson<ChapterPlan>(`/api/chapters/${chapterId}/plan`);
++/** 读取章节工作台唯一权威状态，不由前端拼接多个最新记录。 */
++export const getChapterWorkflow = (chapterId: string) =>
++  requestJson<ChapterWorkflowRead>(`/api/chapters/${chapterId}/workflow`);
++
++export type ChapterRunRequest = {
++  run_scope: "chapter";
++  request_type: "new_chapter" | "review";
++  decision_target: "plan" | "chapter";
++  chapter_intent?: { text: string; [key: string]: unknown };
++  author_feedback?: { text: string; [key: string]: unknown };
++  plan_revision_id?: string;
++};
+ 
+-/** 初始化并接受章节计划（幂等命令）：已存在 accepted plan 时直接返回当前指针。 */
+-export const createChapterPlan = (chapterId: string, key: string) =>
+-  requestJson<ChapterPlan>(`/api/chapters/${chapterId}/plan`, {
++/** 启动章节规划或章节审校运行；章节主流程不得调用旧 plan 初始化接口。 */
++export const createChapterRun = (chapterId: string, payload: ChapterRunRequest, key: string) =>
++  requestJson<RunSnapshot>(`/api/chapters/${chapterId}/runs`, {
+     method: "POST",
++    body: payload,
+     idempotencyKey: key,
+   });
+ 
+ export type SceneRunRequest = {
+   run_scope: "scene";
+   request_type: "continue" | "rewrite" | "review";
+   decision_target: "scene";
+   plan_revision_id: string;
+   base_scene_revision_id: string | null;
+   /** 选中片段续写/改写时携带选中文本；审校可不带。 */
+@@ -249,27 +259,31 @@ export const createSceneRun = (sceneId: string, payload: SceneRunRequest, key: s
+     idempotencyKey: key,
+   });
+ 
+ /** 读取运行快照。 */
+ export const getRun = (runId: string) => requestJson<RunSnapshot>(`/api/runs/${runId}`);
+ 
+ export type RunDecisionBody = {
+   /** 必须等于请求头 Idempotency-Key（后端强制校验）。 */
+   idempotency_key: string;
+   expected_run_version: number;
+-  target: "scene";
++  target: "plan" | "scene" | "chapter";
+   decision: "accept" | "feedback" | "cancel";
+   text?: string;
+   /** 首稿场景接受时携带（运行产生的 draft，随 SSE 事件下发）。 */
+   draft_artifact_id?: string;
+   /** 已有 accepted 版本场景接受时携带（运行产生的 ChangeSet）。 */
+   change_set_id?: string;
++  plan_revision_id?: string;
++  expected_current_plan_revision_id?: string | null;
++  expected_plan_version?: number | null;
++  chapter_revision_id?: string;
+ };
+ 
+ /** 作者决策：accept（接受）/ feedback（反馈或澄清回答）/ cancel（取消）。 */
+ export const submitRunDecision = (runId: string, body: RunDecisionBody, key: string) =>
+   requestJson<DecisionResponse>(`/api/runs/${runId}/decisions`, {
+     method: "POST",
+     body: { ...body, idempotency_key: key },
+     idempotencyKey: key,
+   });
+ 
+diff --git a/frontend/src/types/index.ts b/frontend/src/types/index.ts
+index 06994dc..00a201c 100644
+--- a/frontend/src/types/index.ts
++++ b/frontend/src/types/index.ts
+@@ -145,37 +145,81 @@ export type RunSnapshot = {
+   current_node: string | null;
+   pending_node: string | null;
+   pause_reason: string | null;
+   clarification_questions: string[];
+   last_error_code: string | null;
+   last_event_sequence: number;
+   created_at: string;
+   updated_at: string;
+ };
+ 
+-/** 章节当前 accepted plan 只读视图（ChapterPlanRead）。 */
+-export type ChapterPlan = {
++/** 章节工作台唯一权威读取快照；阶段和待决动作均由服务端返回。 */
++export type ChapterWorkflowRead = {
+   chapter_id: string;
+-  plan_revision_id: string | null;
+-  plan_status: string | null;
+-  plan_version: number | null;
+-  chapter_contract: {
+-    outline?: string;
+-    scenes?: Array<{
+-      scene_id?: string;
+-      title?: string;
+-      scene_brief?: Record<string, unknown>;
+-      [key: string]: unknown;
++  phase: "intent_required" | "planning" | "plan_feedback" | "scene_generation" | "scene_feedback" | "chapter_review" | "chapter_feedback" | "canon_feedback" | "completed" | "blocked";
++  chapter_status: string;
++  pending_decision: {
++    target: "plan" | "scene" | "chapter" | "canon" | null;
++    kind: string | null;
++    run_id: string | null;
++    expected_run_version: number | null;
++  };
++  intent: {
++    text: string;
++    optional_fields: Record<string, unknown>;
++    unresolved_questions: string[];
++  };
++  plan_discussion: {
++    messages: Array<Record<string, unknown>>;
++    pending_questions: Array<{ question_id: string; text: string; impact?: string | null }>;
++    pending_proposals: Array<{ proposal_id: string; field_path: string; value: unknown; source: string; status: string; rationale?: string | null }>;
++  };
++  plan: {
++    candidate_revision_id: string | null;
++    accepted_revision_id: string | null;
++    candidate_version: number | null;
++    accepted_version: number | null;
++    status: "none" | "candidate" | "accepted" | string;
++    contract: Record<string, unknown> | null;
++    contract_field_provenance: Record<string, unknown>;
++    scene_briefs: Array<{ client_key: string; order: number; title: string; brief: Record<string, unknown>; field_provenance: Record<string, unknown>; status: string }>;
++  };
++  scenes: Array<{ scene_id: string; order: number; title: string; status: string; accepted_revision_id: string | null; current_run_id: string | null; blocking_reasons: string[] }>;
++  chapter_revision: {
++    staged_revision_id: string | null;
++    accepted_revision_id: string | null;
++    review_run_id: string | null;
++    review_issues: ReviewIssueItem[];
++    review_summary: Record<string, unknown>;
++    history: Array<{
++      id: string;
++      parent_revision_id: string | null;
++      status: string;
++      reason: string | null;
++      created_at: string;
++      scene_versions: Array<{ scene_id: string; scene_revision_id: string; sort_order: number }>;
++      review_issues: ReviewIssueItem[];
++      review_summary: Record<string, unknown>;
++      is_current_accepted: boolean;
+     }>;
+-    [key: string]: unknown;
+-  } | null;
+-  plan_reason: string | null;
++  };
++  active_run: (RunSnapshot & { decision_target?: string | null }) | null;
++  affected_scene_ids: string[];
++  stale_scene_ids: string[];
++  blocking_reasons: string[];
++  canon_run_id: string | null;
++  canon: {
++    run_id: string | null;
++    status: string | null;
++    source_revision_id: string | null;
++    pending_candidate_count: number;
++  };
+ };
+ 
+ /** SSE 运行事件信封（RunEventEnvelope + 帧 id）。 */
+ export type RunEvent = {
+   /** 稳定唯一事件 id（`run_id:sequence`），用于 Last-Event-ID 与去重。 */
+   id: string;
+   sequence: number;
+   type: string;
+   run_id: string;
+   payload_schema: string;
+@@ -253,20 +297,23 @@ export type CanonCandidate = {
+   source_identity: string;
+   content: CanonCandidateContent;
+   local_key: string | null;
+   generation_run_id: string | null;
+ };
+ 
+ /** 场景/章节候选列表（CanonCandidateListRead）。 */
+ export type CanonCandidateList = {
+   target_type: "scene" | "chapter";
+   target_id: string;
++  source_revision_id: string | null;
++  run_id: string | null;
++  run_status: string | null;
+   items: CanonCandidate[];
+ };
+ 
+ /** Canon 运行创建请求（CanonRunCreateRequest）。 */
+ export type CanonRunCreateRequest = {
+   canon_scope: "chapter" | "scene";
+   accepted_chapter_revision_id?: string | null;
+   accepted_scene_revision_id?: string | null;
+   chapter_intent?: Record<string, unknown> | null;
+   author_feedback?: Record<string, unknown> | null;
+diff --git a/frontend/tests/editor.spec.ts b/frontend/tests/editor.spec.ts
+index fc6de74..734a66a 100644
+--- a/frontend/tests/editor.spec.ts
++++ b/frontend/tests/editor.spec.ts
+@@ -284,20 +284,35 @@ test("context menu deletes a project after confirmation", async ({ page, request
+   await page.goto("/");
+ 
+   const project = page.locator(".tree-label", { hasText: `${prefix}-P` });
+   await project.click({ button: "right" });
+   await expect(page.getByRole("menuitem", { name: "删除" })).toBeVisible();
+   page.once("dialog", (dialog) => void dialog.accept());
+   await page.getByRole("menuitem", { name: "删除" }).click();
+   await expect(project).not.toBeVisible();
+ });
+ 
+-test("displays the generated chapter plan", async ({ page, request }) => {
++test("scene workspace loads plan state from workflow and keeps the editor usable", async ({
++  page,
++  request,
++}) => {
+   const prefix = `plan-ui-${Date.now()}`;
+   await createHierarchy(request, prefix);
++
++  const legacyPlanRequests: string[] = [];
++  page.on("request", (req) => {
++    if (req.method() === "GET" && req.url().includes("/api/chapters/") && req.url().endsWith("/plan")) {
++      legacyPlanRequests.push(req.url());
++    }
++  });
++
+   await openScene(page, `${prefix}-P`, "场景");
+ 
+-  await page.getByRole("button", { name: "生成章节计划" }).click();
+-  await expect(page.getByTestId("status-message")).toContainText("章节计划已就绪");
+-  await expect(page.getByTestId("chapter-plan-panel")).toContainText("init-plan");
+-  await expect(page.getByTestId("chapter-plan-panel")).toContainText("场景");
++  await expect(page.getByTestId("chapter-plan-panel")).toBeVisible();
++  await expect(page.getByTestId("chapter-plan-panel")).toContainText("尚未生成章节计划");
++  expect(legacyPlanRequests).toEqual([]);
++
++  await page.locator(".tiptap").click();
++  await page.keyboard.type("计划迁移后仍可编辑", { delay: 5 });
++  await page.getByTestId("btn-save").click();
++  await expect(page.getByTestId("status-message")).toContainText("已保存并提交版本");
+ });

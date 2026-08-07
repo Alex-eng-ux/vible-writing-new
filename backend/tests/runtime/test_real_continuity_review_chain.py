@@ -100,7 +100,12 @@ def _create_scene_run_with_accepted_baseline(db, run_id: str) -> None:
         run_version=1,
         request_type="continue",
         decision_target="scene",
-        normalized_input={"run_scope": "scene", "request_type": "continue", "decision_target": "scene"},
+        normalized_input={
+            "run_scope": "scene",
+            "request_type": "continue",
+            "decision_target": "scene",
+            "base_scene_revision_id": rev.id,
+        },
     )
     db.add(run)
     db.flush()

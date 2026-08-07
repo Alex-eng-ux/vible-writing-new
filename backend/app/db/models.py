@@ -120,6 +120,21 @@ class ChapterPlanRevision(Base):
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     plan_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Planner 候选的不可变来源与血缘。candidate_version 只在同一规划血缘内
+    # 单调递增；accepted pointer 的 plan_version 与候选版本分开维护。
+    candidate_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    planning_lineage_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    contract_field_provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    scene_briefs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    unresolved_assumptions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    __table_args__ = (
+        # 同一运行节点重试只能保留一个语义候选；source_run_id 为空的兼容
+        # 初始化计划不受该约束影响。
+        UniqueConstraint("source_run_id", name="uq_chapter_plan_source_run"),
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
 
 
@@ -134,6 +149,84 @@ class ChapterPlanRevisionLink(Base):
     )
     plan_version: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+
+
+class ChapterPlanDiscussionMessage(Base):
+    """章节规划讨论消息；正文是业务数据，不以观测哈希替代。"""
+
+    __tablename__ = "chapter_plan_discussion_messages"
+
+    message_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
+    planning_lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    message_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    agent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    parent_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    supersedes_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    checkpoint_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("planning_lineage_id", "message_sequence", name="uq_plan_message_sequence"),
+    )
+
+
+class ChapterPlanQuestion(Base):
+    """Planner 待回答问题，question_id 在规划血缘内稳定。"""
+
+    __tablename__ = "chapter_plan_questions"
+
+    question_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
+    planning_lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    impact: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+
+
+class ChapterPlanProposal(Base):
+    """Planner 建议及作者决策；未确认建议不能进入 accepted 契约。"""
+
+    __tablename__ = "chapter_plan_proposals"
+
+    proposal_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
+    planning_lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    field_path: Mapped[str] = mapped_column(String(255), nullable=False)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="ai")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("planning_lineage_id", "field_path", "source_run_id", name="uq_plan_proposal_source"),
+    )
+
+
+class ChapterPlanSceneLink(Base):
+    """accepted plan 的固定 client_key -> scene_id 顺序映射。"""
+
+    __tablename__ = "chapter_plan_scene_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
+    plan_revision_id: Mapped[str] = mapped_column(ForeignKey("chapter_plan_revisions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    client_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id", ondelete="RESTRICT"), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("plan_revision_id", "client_key", name="uq_plan_scene_client_key"),
+        UniqueConstraint("plan_revision_id", "sort_order", name="uq_plan_scene_order"),
+    )
 
 
 class SceneRevision(Base):
@@ -198,6 +291,10 @@ class ChapterRevision(Base):
     parent_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="staged")
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    # 章节审校结果只记录结构化问题与摘要，不把审校意见写回任何场景正文。
+    review_issues: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    review_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    review_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
 
 

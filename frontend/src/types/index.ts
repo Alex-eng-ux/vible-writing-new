@@ -152,23 +152,67 @@ export type RunSnapshot = {
   updated_at: string;
 };
 
-/** 章节当前 accepted plan 只读视图（ChapterPlanRead）。 */
-export type ChapterPlan = {
+/** 章节工作台唯一权威读取快照；阶段和待决动作均由服务端返回。 */
+export type ChapterWorkflowRead = {
   chapter_id: string;
-  plan_revision_id: string | null;
-  plan_status: string | null;
-  plan_version: number | null;
-  chapter_contract: {
-    outline?: string;
-    scenes?: Array<{
-      scene_id?: string;
-      title?: string;
-      scene_brief?: Record<string, unknown>;
-      [key: string]: unknown;
+  phase: "intent_required" | "planning" | "plan_feedback" | "scene_generation" | "scene_feedback" | "chapter_review" | "chapter_feedback" | "canon_feedback" | "completed" | "blocked";
+  chapter_status: string;
+  pending_decision: {
+    target: "plan" | "scene" | "chapter" | "canon" | null;
+    kind: string | null;
+    run_id: string | null;
+    expected_run_version: number | null;
+  };
+  intent: {
+    text: string;
+    optional_fields: Record<string, unknown>;
+    unresolved_questions: string[];
+  };
+  plan_discussion: {
+    messages: Array<Record<string, unknown>>;
+    pending_questions: Array<{ question_id: string; text: string; impact?: string | null }>;
+    pending_proposals: Array<{ proposal_id: string; field_path: string; value: unknown; source: string; status: string; rationale?: string | null }>;
+  };
+  plan: {
+    candidate_revision_id: string | null;
+    accepted_revision_id: string | null;
+    candidate_version: number | null;
+    accepted_version: number | null;
+    status: "none" | "candidate" | "accepted" | string;
+    contract: Record<string, unknown> | null;
+    contract_field_provenance: Record<string, unknown>;
+    scene_briefs: Array<{ client_key: string; order: number; title: string; brief: Record<string, unknown>; field_provenance: Record<string, unknown>; status: string }>;
+  };
+  scenes: Array<{ scene_id: string; order: number; title: string; status: string; accepted_revision_id: string | null; current_run_id: string | null; blocking_reasons: string[] }>;
+  chapter_revision: {
+    staged_revision_id: string | null;
+    accepted_revision_id: string | null;
+    review_run_id: string | null;
+    review_issues: ReviewIssueItem[];
+    review_summary: Record<string, unknown>;
+    history: Array<{
+      id: string;
+      parent_revision_id: string | null;
+      status: string;
+      reason: string | null;
+      created_at: string;
+      scene_versions: Array<{ scene_id: string; scene_revision_id: string; sort_order: number }>;
+      review_issues: ReviewIssueItem[];
+      review_summary: Record<string, unknown>;
+      is_current_accepted: boolean;
     }>;
-    [key: string]: unknown;
-  } | null;
-  plan_reason: string | null;
+  };
+  active_run: (RunSnapshot & { decision_target?: string | null }) | null;
+  affected_scene_ids: string[];
+  stale_scene_ids: string[];
+  blocking_reasons: string[];
+  canon_run_id: string | null;
+  canon: {
+    run_id: string | null;
+    status: string | null;
+    source_revision_id: string | null;
+    pending_candidate_count: number;
+  };
 };
 
 /** SSE 运行事件信封（RunEventEnvelope + 帧 id）。 */
@@ -260,6 +304,9 @@ export type CanonCandidate = {
 export type CanonCandidateList = {
   target_type: "scene" | "chapter";
   target_id: string;
+  source_revision_id: string | null;
+  run_id: string | null;
+  run_status: string | null;
   items: CanonCandidate[];
 };
 

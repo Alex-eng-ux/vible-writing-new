@@ -1,0 +1,1762 @@
+﻿diff --git a/backend/app/agents/chapter_graph.py b/backend/app/agents/chapter_graph.py
+index a6485ab..4c00579 100644
+--- a/backend/app/agents/chapter_graph.py
++++ b/backend/app/agents/chapter_graph.py
+@@ -140,9 +140,53 @@ class ChapterGraph:
+             feedback = state.get("author_feedback")
+             if feedback:
+                 envelope = envelope.model_copy(update={"author_feedback": feedback})
++            if agent_type == _REVIEW and self._aggregator is not None:
++                chapter_id = envelope.runtime_context.chapter_id
++                if chapter_id is not None:
++                    eligibility = self._aggregator.eligibility(
++                        chapter_id,
++                        envelope.entry_handoff_id,
++                        envelope.entry_source_chapter_revision_id,
++                        envelope.entry_handoff_chain_hash,
++                    )
++                    if not eligibility.eligible:
++                        state["pending_node"] = _REVIEW
++                        state["clarification_questions"] = [eligibility.reason]
++                        state["run_status"] = "paused"
++                        return {
++                            "pending_node": _REVIEW,
++                            "clarification_questions": [eligibility.reason],
++                            "run_status": "paused",
++                            "last_durable_node": _REVIEW,
++                            "error_code": eligibility.status,
++                        }
+             result = callable_(state, envelope)
++            # Planner 候选只在 Worker 的持久化事务中提交；把结构化结果返回给 Worker，
++            # 不把正文或讨论写入观测 sink，也不把候选当作 accepted 版本。
++            planner_output = result.get("output") if agent_type == _PLAN else None
++            chapter_review_output = result.get("output") if agent_type == _REVIEW else None
+             state["last_durable_node"] = result.get("last_durable_node") or agent_type
+             outcome = result.get("outcome")
++            if (
++                agent_type == _PLAN
++                and envelope.request_type == "new_chapter"
++                and outcome is not None
++                and outcome.status == "continue"
++                and getattr(planner_output, "status", None) == "ready"
++            ):
++                # 首次规划只产生待作者确认的候选，不能沿旧 ChapterGraph
++                # 直接进入章节审校/聚合；接受计划后由领域事务和场景队列接管。
++                response = {
++                    "pending_node": _PLAN,
++                    "clarification_questions": [],
++                    "run_status": "paused",
++                    "last_durable_node": agent_type,
++                }
++                if planner_output is not None:
++                    response["planner_output"] = planner_output.model_dump()
++                if chapter_review_output is not None:
++                    response["chapter_review_output"] = chapter_review_output.model_dump()
++                return response
+             if outcome is not None and outcome.status in (
+                 "needs_clarification",
+                 "feedback",
+@@ -152,16 +196,27 @@ class ChapterGraph:
+                 state["pending_node"] = outcome.pending_node
+                 state["clarification_questions"] = outcome.clarification_questions
+                 state["run_status"] = "paused"
+-                return {
++                response = {
+                     "pending_node": outcome.pending_node,
+                     "clarification_questions": outcome.clarification_questions,
+                     "run_status": "paused",
+                     "last_durable_node": agent_type,
+                 }
+-            return {
++                if planner_output is not None:
++                    response["planner_output"] = planner_output.model_dump()
++                if chapter_review_output is not None:
++                    response["chapter_review_output"] = chapter_review_output.model_dump()
++                return response
++            response = {
+                 "last_durable_node": agent_type,
+                 "run_status": "running",
+             }
++            if planner_output is not None:
++                response["planner_output"] = planner_output.model_dump()
++            if chapter_review_output is not None:
++                state["chapter_review_output"] = chapter_review_output.model_dump()
++                response["chapter_review_output"] = chapter_review_output.model_dump()
++            return response
+ 
+         return run
+ 
+@@ -200,7 +255,7 @@ class ChapterGraph:
+                     "owner_id": envelope.write_fence_owner_id,
+                     "fencing_token": envelope.write_fence_fencing_token,
+                 }
+-            self._aggregator.aggregate(
++            revision_id = self._aggregator.aggregate(
+                 chapter_id,
+                 reason="chapter aggregation",
+                 ctx={
+@@ -232,6 +287,7 @@ class ChapterGraph:
+                     "expected_run_version": None,
+                 },
+             )
++            state["staged_chapter_revision_id"] = revision_id
+         except AppError as exc:
+             state["run_status"] = "paused"
+             return {
+@@ -244,6 +300,8 @@ class ChapterGraph:
+         return {
+             "last_durable_node": _AGGREGATE,
+             "run_status": "running",
++            "staged_chapter_revision_id": state.get("staged_chapter_revision_id"),
++            "chapter_review_output": state.get("chapter_review_output"),
+         }
+ 
+     def _route_after_pause(self, state: ChapterRunState) -> str:
+diff --git a/backend/app/agents/state.py b/backend/app/agents/state.py
+index a200e9b..24ea2cd 100644
+--- a/backend/app/agents/state.py
++++ b/backend/app/agents/state.py
+@@ -36,6 +36,11 @@ class ChapterRunState(TypedDict, total=False):
+     plan_revision_id: str | None
+     draft_artifact_id: str | None
+     clarification_questions: list[str]
++    # Planner 候选只作为当前运行的结构化中间结果传给 Worker 持久化；
++    # 不代表 accepted plan，也不供场景/Canon Agent 直接消费。
++    planner_output: dict | None
++    chapter_review_output: dict | None
++    staged_chapter_revision_id: str | None
+     scene_auto_revision_counts: dict[str, int]
+     parent_generation_run_id: str | None
+     supersedes_run_id: str | None
+diff --git a/backend/app/api/chapters.py b/backend/app/api/chapters.py
+index fbe08b0..c25b417 100644
+--- a/backend/app/api/chapters.py
++++ b/backend/app/api/chapters.py
+@@ -17,10 +17,12 @@ from ..db.models import (
+     ChapterPlanRevision,
+     ChapterPlanRevisionLink,
+     ChapterRevision,
++    ChapterRevisionScene,
+     Scene,
+ )
+ from ..domain.chapters import (
+     accept_chapter_plan_revision,
++    chapter_workflow_read,
+     create_chapter_plan_revision,
+     create_scene,
+     materialize_chapter_plan,
+@@ -39,6 +41,7 @@ from .schemas import (
+     ChapterPlanRead,
+     ChapterRead,
+     ChapterRevisionRead,
++    ChapterWorkflowRead,
+     ResourceCreated,
+     RollbackRequest,
+     SceneCreate,
+@@ -48,6 +51,35 @@ from .schemas import (
+ router = APIRouter(prefix="/api/chapters", tags=["chapters"])
+ 
+ 
++def _chapter_revision_read(session: Session, revision: ChapterRevision) -> dict:
++    """构造包含固定场景映射、审校摘要和当前 accepted 指针的版本读模型。"""
++    chapter = session.get(Chapter, revision.chapter_id)
++    scene_versions = [
++        {
++            "scene_id": row.scene_id,
++            "scene_revision_id": row.scene_revision_id,
++            "sort_order": row.sort_order,
++        }
++        for row in session.execute(
++            select(ChapterRevisionScene)
++            .where(ChapterRevisionScene.chapter_revision_id == revision.id)
++            .order_by(ChapterRevisionScene.sort_order)
++        ).scalars()
++    ]
++    return {
++        "id": revision.id,
++        "parent_revision_id": revision.parent_revision_id,
++        "chapter_id": revision.chapter_id,
++        "status": revision.status,
++        "reason": revision.reason,
++        "created_at": revision.created_at.isoformat(),
++        "scene_versions": scene_versions,
++        "review_issues": revision.review_issues or [],
++        "review_summary": revision.review_summary or {},
++        "is_current_accepted": bool(chapter and chapter.accepted_chapter_revision_id == revision.id),
++    }
++
++
+ @router.delete("/{chapter_id}", status_code=204)
+ def remove_chapter(
+     chapter_id: str,
+@@ -198,6 +230,15 @@ def get_chapter_plan(
+     )
+ 
+ 
++@router.get("/{chapter_id}/workflow", response_model=ChapterWorkflowRead)
++def get_chapter_workflow(
++    chapter_id: str,
++    session: Session = Depends(get_db),
++) -> ChapterWorkflowRead:
++    """返回章节工作台单一权威组合视图。"""
++    return ChapterWorkflowRead(**chapter_workflow_read(session, chapter_id))
++
++
+ # 初始章节计划：把章节现有场景映射进计划（稳定 client_key -> scene_id），
+ # 无场景时创建空计划。作者接受后（ChapterPlanRevisionLink），场景续写/改写/
+ # 审校运行即可用。计划内容由 planner 生成仍属后续任务；本接口只做幂等的
+@@ -371,18 +412,24 @@ def list_chapter_revisions(
+         .all()
+     )
+     return [
+-        ChapterRevisionRead(
+-            id=rev.id,
+-            parent_revision_id=rev.parent_revision_id,
+-            chapter_id=rev.chapter_id,
+-            status=rev.status,
+-            reason=rev.reason,
+-            created_at=rev.created_at.isoformat(),
+-        )
++        ChapterRevisionRead(**_chapter_revision_read(session, rev))
+         for rev in rows
+     ]
+ 
+ 
++@router.get("/{chapter_id}/revisions/{revision_id}", response_model=ChapterRevisionRead)
++def get_chapter_revision(
++    chapter_id: str,
++    revision_id: str,
++    session: Session = Depends(get_db),
++) -> ChapterRevisionRead:
++    """读取单个章节版本及其固定场景版本映射和审校结果。"""
++    revision = session.get(ChapterRevision, revision_id)
++    if revision is None or revision.chapter_id != chapter_id:
++        raise AppError("CONTEXT_SOURCE_UNAVAILABLE", "chapter revision not found")
++    return ChapterRevisionRead(**_chapter_revision_read(session, revision))
++
++
+ @router.get("/{chapter_id}/handoff", response_model=ChapterHandoffRead | None)
+ def get_chapter_handoff(
+     chapter_id: str,
+@@ -434,14 +481,7 @@ def post_chapter_rollback(
+                 },
+             ),
+         )
+-        response = {
+-            "id": rev.id,
+-            "parent_revision_id": rev.parent_revision_id,
+-            "chapter_id": rev.chapter_id,
+-            "status": rev.status,
+-            "reason": rev.reason,
+-            "created_at": rev.created_at.isoformat(),
+-        }
++        response = _chapter_revision_read(session, rev)
+         return response, rev.id
+ 
+     return ChapterRevisionRead(
+diff --git a/backend/app/api/schemas.py b/backend/app/api/schemas.py
+index d2c9bef..8ec7b02 100644
+--- a/backend/app/api/schemas.py
++++ b/backend/app/api/schemas.py
+@@ -189,6 +189,10 @@ class ChapterRevisionRead(BaseModel):
+     status: str
+     reason: str
+     created_at: str
++    scene_versions: list[dict] = Field(default_factory=list)
++    review_issues: list[dict] = Field(default_factory=list)
++    review_summary: dict = Field(default_factory=dict)
++    is_current_accepted: bool = False
+ 
+ 
+ class ChapterHandoffRead(BaseModel):
+@@ -247,6 +251,8 @@ class RunSnapshot(BaseModel):
+     target_id: str
+     run_scope: Literal["chapter", "scene"]
+     request_type: str
++    plan_revision_id: str | None = None
++    base_scene_revision_id: str | None = None
+     status: Literal[
+         "queued", "running", "waiting_feedback", "pending_clarification",
+         "paused", "accepted", "cancelled", "failed", "superseded",
+@@ -297,6 +303,8 @@ class DecisionRequest(BaseModel):
+     chapter_revision_id: str | None = None
+     candidate_decisions: list[CandidateDecisionItem] = Field(default_factory=list)
+     canon_feedback: dict | None = None
++    # 章节规划反馈采用结构化问题/建议决策；旧客户端仍可使用 text。
++    feedback: dict | None = None
+ 
+ 
+ class ResumeRequest(BaseModel):
+@@ -391,6 +399,58 @@ class ChapterPlanRead(BaseModel):
+     plan_reason: str | None = None
+ 
+ 
++class PlanPendingQuestionRead(BaseModel):
++    question_id: str
++    text: str
++    impact: str = ""
++
++
++class PlanPendingProposalRead(BaseModel):
++    proposal_id: str
++    field_path: str
++    value: Any = None
++    source: Literal["ai"] = "ai"
++    status: Literal["pending", "accepted", "modified", "rejected"] = "pending"
++    rationale: str = ""
++
++
++class PlanDiscussionMessageRead(BaseModel):
++    message_id: str
++    message_sequence: int
++    role: Literal["author", "planner"]
++    agent: Literal["ChapterPlannerAgent"] | None = None
++    kind: Literal["intent", "question", "answer", "feedback", "proposal", "decision"]
++    text: str
++    created_at: str
++    source_run_id: str | None = None
++    parent_run_id: str | None = None
++    supersedes_run_id: str | None = None
++    checkpoint_id: str | None = None
++
++
++class ChapterWorkflowRead(BaseModel):
++    """章节工作台的权威组合读取视图；前端不得自行拼接最新记录。"""
++
++    chapter_id: str
++    phase: Literal[
++        "intent_required", "planning", "plan_feedback", "scene_generation",
++        "scene_feedback", "chapter_review", "chapter_feedback", "canon_feedback",
++        "completed", "blocked",
++    ]
++    chapter_status: str
++    pending_decision: dict
++    intent: dict
++    plan_discussion: dict
++    plan: dict
++    scenes: list[dict] = Field(default_factory=list)
++    chapter_revision: dict
++    active_run: dict | None = None
++    affected_scene_ids: list[str] = Field(default_factory=list)
++    stale_scene_ids: list[str] = Field(default_factory=list)
++    blocking_reasons: list[str] = Field(default_factory=list)
++    canon_run_id: str | None = None
++
++
+ # ---------------------------------------------------------------------------
+ # Task 7C：只读 Story Bible / Canon 候选 schema（只追加，不修改冻结字段）。
+ # ---------------------------------------------------------------------------
+diff --git a/backend/app/db/models.py b/backend/app/db/models.py
+index 19e2dba..54c42a3 100644
+--- a/backend/app/db/models.py
++++ b/backend/app/db/models.py
+@@ -120,6 +120,21 @@ class ChapterPlanRevision(Base):
+     reason: Mapped[str] = mapped_column(String(500), nullable=False)
+     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+     plan_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
++    # Planner 候选的不可变来源与血缘。candidate_version 只在同一规划血缘内
++    # 单调递增；accepted pointer 的 plan_version 与候选版本分开维护。
++    candidate_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
++    planning_lineage_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
++    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
++    contract_field_provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
++    scene_briefs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
++    unresolved_assumptions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
++    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
++
++    __table_args__ = (
++        # 同一运行节点重试只能保留一个语义候选；source_run_id 为空的兼容
++        # 初始化计划不受该约束影响。
++        UniqueConstraint("source_run_id", name="uq_chapter_plan_source_run"),
++    )
+     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+ 
+ 
+@@ -136,6 +151,84 @@ class ChapterPlanRevisionLink(Base):
+     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+ 
+ 
++class ChapterPlanDiscussionMessage(Base):
++    """章节规划讨论消息；正文是业务数据，不以观测哈希替代。"""
++
++    __tablename__ = "chapter_plan_discussion_messages"
++
++    message_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
++    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
++    planning_lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
++    message_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
++    role: Mapped[str] = mapped_column(String(32), nullable=False)
++    agent: Mapped[str | None] = mapped_column(String(64), nullable=True)
++    kind: Mapped[str] = mapped_column(String(32), nullable=False)
++    text: Mapped[str] = mapped_column(Text, nullable=False)
++    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
++    parent_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
++    supersedes_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
++    checkpoint_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
++    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
++
++    __table_args__ = (
++        UniqueConstraint("planning_lineage_id", "message_sequence", name="uq_plan_message_sequence"),
++    )
++
++
++class ChapterPlanQuestion(Base):
++    """Planner 待回答问题，question_id 在规划血缘内稳定。"""
++
++    __tablename__ = "chapter_plan_questions"
++
++    question_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
++    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
++    planning_lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
++    text: Mapped[str] = mapped_column(Text, nullable=False)
++    impact: Mapped[str] = mapped_column(String(255), nullable=False, default="")
++    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
++    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
++    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
++
++
++class ChapterPlanProposal(Base):
++    """Planner 建议及作者决策；未确认建议不能进入 accepted 契约。"""
++
++    __tablename__ = "chapter_plan_proposals"
++
++    proposal_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
++    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
++    planning_lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
++    field_path: Mapped[str] = mapped_column(String(255), nullable=False)
++    value: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
++    source: Mapped[str] = mapped_column(String(32), nullable=False, default="ai")
++    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
++    rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
++    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
++    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
++
++    __table_args__ = (
++        UniqueConstraint("planning_lineage_id", "field_path", "source_run_id", name="uq_plan_proposal_source"),
++    )
++
++
++class ChapterPlanSceneLink(Base):
++    """accepted plan 的固定 client_key -> scene_id 顺序映射。"""
++
++    __tablename__ = "chapter_plan_scene_links"
++
++    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
++    chapter_id: Mapped[str] = mapped_column(ForeignKey("chapters.id", ondelete="RESTRICT"), nullable=False, index=True)
++    plan_revision_id: Mapped[str] = mapped_column(ForeignKey("chapter_plan_revisions.id", ondelete="RESTRICT"), nullable=False, index=True)
++    client_key: Mapped[str] = mapped_column(String(120), nullable=False)
++    scene_id: Mapped[str] = mapped_column(ForeignKey("scenes.id", ondelete="RESTRICT"), nullable=False)
++    sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
++
++    __table_args__ = (
++        UniqueConstraint("plan_revision_id", "client_key", name="uq_plan_scene_client_key"),
++        UniqueConstraint("plan_revision_id", "sort_order", name="uq_plan_scene_order"),
++    )
++
++
+ class SceneRevision(Base):
+     __tablename__ = "scene_revisions"
+ 
+@@ -198,6 +291,10 @@ class ChapterRevision(Base):
+     parent_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+     status: Mapped[str] = mapped_column(String(32), nullable=False, default="staged")
+     reason: Mapped[str] = mapped_column(String(500), nullable=False)
++    # 章节审校结果只记录结构化问题与摘要，不把审校意见写回任何场景正文。
++    review_issues: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
++    review_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
++    review_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
+ 
+ 
+diff --git a/backend/app/domain/chapters.py b/backend/app/domain/chapters.py
+index 8e2f326..382e5b2 100644
+--- a/backend/app/domain/chapters.py
++++ b/backend/app/domain/chapters.py
+@@ -5,12 +5,17 @@ from sqlalchemy.orm import Session
+ 
+ from ..db.models import (
+     Chapter,
++    ChapterPlanDiscussionMessage,
++    ChapterPlanProposal,
++    ChapterPlanQuestion,
+     ChapterPlanRevision,
+     ChapterPlanRevisionLink,
++    ChapterPlanSceneLink,
+     ChapterRevision,
+     ChapterRevisionScene,
+     GenerationRun,
+     Scene,
++    SceneRevision,
+ )
+ from ..errors import AppError
+ from .interfaces import CommandContext, ResourceCommandContext
+@@ -70,23 +75,214 @@ def create_chapter_plan_revision(
+     return plan
+ 
+ 
++def persist_chapter_plan_candidate(
++    session: Session,
++    chapter_id: str,
++    *,
++    source_run_id: str,
++    planning_lineage_id: str,
++    chapter_contract: dict,
++    scene_briefs: list[dict],
++    reason: str,
++    contract_field_provenance: dict | None = None,
++    unresolved_assumptions: list[str] | None = None,
++    ctx: CommandContext,
++) -> ChapterPlanRevision:
++    """幂等保存 Planner 候选；候选始终保持 pending，不能绕过作者接受。"""
++    chapter = session.get(Chapter, chapter_id)
++    if chapter is None:
++        raise AppError("CONTEXT_SOURCE_UNAVAILABLE", "chapter not found")
++    existing = session.execute(
++        select(ChapterPlanRevision)
++        .where(ChapterPlanRevision.source_run_id == source_run_id)
++        .with_for_update()
++    ).scalar_one_or_none()
++    if existing is not None:
++        if existing.chapter_id != chapter_id:
++            raise AppError("PLAN_REVISION_CONFLICT", "source run belongs to another chapter")
++        return existing
++    previous = session.execute(
++        select(ChapterPlanRevision)
++        .where(ChapterPlanRevision.planning_lineage_id == planning_lineage_id)
++        .order_by(ChapterPlanRevision.candidate_version.desc())
++        .limit(1)
++    ).scalar_one_or_none()
++    candidate_version = (previous.candidate_version + 1) if previous else 1
++    normalized_briefs = list(scene_briefs)
++    contract = dict(chapter_contract or {})
++    contract["scenes"] = normalized_briefs
++    plan = ChapterPlanRevision(
++        chapter_id=chapter_id,
++        parent_plan_revision_id=previous.id if previous else None,
++        chapter_contract=contract,
++        reason=reason,
++        status="pending",
++        plan_version=1,
++        candidate_version=candidate_version,
++        planning_lineage_id=planning_lineage_id,
++        source_run_id=source_run_id,
++        contract_field_provenance=contract_field_provenance or {},
++        scene_briefs=normalized_briefs,
++        unresolved_assumptions=unresolved_assumptions or [],
++        idempotency_key=ctx.get("idempotency_key"),
++    )
++    session.add(plan)
++    session.flush()
++    return plan
++
++
++def append_plan_discussion_message(
++    session: Session,
++    chapter_id: str,
++    planning_lineage_id: str,
++    *,
++    role: str,
++    kind: str,
++    text: str,
++    agent: str | None = None,
++    source_run_id: str | None = None,
++    parent_run_id: str | None = None,
++    supersedes_run_id: str | None = None,
++    checkpoint_id: str | None = None,
++) -> ChapterPlanDiscussionMessage:
++    """按规划血缘分配单调消息序号并持久化正文。"""
++    last = session.execute(
++        select(ChapterPlanDiscussionMessage)
++        .where(ChapterPlanDiscussionMessage.planning_lineage_id == planning_lineage_id)
++        .order_by(ChapterPlanDiscussionMessage.message_sequence.desc())
++        .limit(1)
++        .with_for_update()
++    ).scalar_one_or_none()
++    message = ChapterPlanDiscussionMessage(
++        chapter_id=chapter_id,
++        planning_lineage_id=planning_lineage_id,
++        message_sequence=(last.message_sequence + 1) if last else 1,
++        role=role,
++        agent=agent,
++        kind=kind,
++        text=text,
++        source_run_id=source_run_id,
++        parent_run_id=parent_run_id,
++        supersedes_run_id=supersedes_run_id,
++        checkpoint_id=checkpoint_id,
++    )
++    session.add(message)
++    session.flush()
++    return message
++
++
++def upsert_plan_questions(
++    session: Session,
++    chapter_id: str,
++    planning_lineage_id: str,
++    questions: list[dict],
++    source_run_id: str | None = None,
++) -> list[ChapterPlanQuestion]:
++    """保存 Planner 问题；有稳定 question_id 时反馈重放复用原记录。"""
++    result: list[ChapterPlanQuestion] = []
++    for item in questions:
++        qid = item.get("question_id")
++        question = session.get(ChapterPlanQuestion, qid) if qid else None
++        if question is None and source_run_id:
++            question = session.execute(
++                select(ChapterPlanQuestion)
++                .where(
++                    ChapterPlanQuestion.planning_lineage_id == planning_lineage_id,
++                    ChapterPlanQuestion.source_run_id == source_run_id,
++                    ChapterPlanQuestion.text == item.get("text", item.get("question", "")),
++                )
++                .limit(1)
++            ).scalar_one_or_none()
++        if question is None:
++            question = ChapterPlanQuestion(
++                question_id=qid or None,
++                chapter_id=chapter_id,
++                planning_lineage_id=planning_lineage_id,
++                text=item.get("text", item.get("question", "")),
++                impact=item.get("impact", ""),
++                status=item.get("status", "pending"),
++                source_run_id=source_run_id,
++            )
++            session.add(question)
++        else:
++            if question.planning_lineage_id != planning_lineage_id:
++                raise AppError("PLAN_REVISION_CONFLICT", "question belongs to another planning lineage")
++        result.append(question)
++    session.flush()
++    return result
++
++
++def upsert_plan_proposals(
++    session: Session,
++    chapter_id: str,
++    planning_lineage_id: str,
++    proposals: list[dict],
++    source_run_id: str | None = None,
++) -> list[ChapterPlanProposal]:
++    """保存 Planner 建议及稳定 proposal_id。"""
++    result: list[ChapterPlanProposal] = []
++    for item in proposals:
++        pid = item.get("proposal_id")
++        proposal = session.get(ChapterPlanProposal, pid) if pid else None
++        if proposal is None and source_run_id:
++            proposal = session.execute(
++                select(ChapterPlanProposal)
++                .where(
++                    ChapterPlanProposal.planning_lineage_id == planning_lineage_id,
++                    ChapterPlanProposal.source_run_id == source_run_id,
++                    ChapterPlanProposal.field_path == item.get("field_path", ""),
++                )
++                .limit(1)
++            ).scalar_one_or_none()
++        if proposal is None:
++            proposal = ChapterPlanProposal(
++                proposal_id=pid or None,
++                chapter_id=chapter_id,
++                planning_lineage_id=planning_lineage_id,
++                field_path=item.get("field_path", ""),
++                value=item.get("value", {}),
++                source=item.get("source", "ai"),
++                status=item.get("status", "pending"),
++                rationale=item.get("rationale", ""),
++                source_run_id=source_run_id,
++            )
++            session.add(proposal)
++        elif proposal.planning_lineage_id != planning_lineage_id:
++            raise AppError("PLAN_REVISION_CONFLICT", "proposal belongs to another planning lineage")
++        result.append(proposal)
++    session.flush()
++    return result
++
++
+ def accept_chapter_plan_revision(
+     session: Session,
+     chapter_id: str,
+     plan_revision_id: str,
+-    expected_current_plan_revision_id: str,
++    expected_current_plan_revision_id: str | None,
+     expected_plan_version: int,
+     ctx: CommandContext,
+ ) -> ChapterPlanRevision:
+     """CAS-accept a plan revision; the current pointer must match expectations."""
+-    plan = session.get(ChapterPlanRevision, plan_revision_id)
++    plan = session.execute(
++        select(ChapterPlanRevision)
++        .where(ChapterPlanRevision.id == plan_revision_id)
++        .with_for_update()
++    ).scalar_one_or_none()
+     if plan is None or plan.chapter_id != chapter_id:
+         raise AppError("PLAN_REVISION_CONFLICT", "plan revision does not belong to the chapter")
+-    if plan.status == "accepted":
+-        return plan  # idempotent accept
+     link = session.execute(
+-        select(ChapterPlanRevisionLink).where(ChapterPlanRevisionLink.chapter_id == chapter_id)
++        select(ChapterPlanRevisionLink)
++        .where(ChapterPlanRevisionLink.chapter_id == chapter_id)
++        .with_for_update()
+     ).scalar_one_or_none()
++    if plan.status == "accepted":
++        if link is None or link.plan_revision_id != plan.id:
++            raise AppError("PLAN_REVISION_CONFLICT", "accepted plan pointer is inconsistent")
++        if expected_current_plan_revision_id != link.plan_revision_id:
++            raise AppError("PLAN_REVISION_CONFLICT", "current plan revision pointer mismatch")
++        if expected_plan_version != link.plan_version:
++            raise AppError("PLAN_REVISION_CONFLICT", "expected plan version mismatch")
++        return plan
+     if link is None:
+         if expected_current_plan_revision_id is not None:
+             raise AppError("PLAN_REVISION_CONFLICT", "no current plan revision exists")
+@@ -99,6 +295,21 @@ def accept_chapter_plan_revision(
+             raise AppError("PLAN_REVISION_CONFLICT", "expected plan version mismatch")
+         plan.plan_version = link.plan_version + 1
+ 
++    provenance = plan.contract_field_provenance or {}
++    unresolved = [
++        path for path, value in provenance.items()
++        if isinstance(value, dict) and value.get("status") in {"ai_suggested", "unresolved"}
++    ]
++    for index, brief in enumerate(plan.scene_briefs or []):
++        for path, value in (brief.get("field_provenance") or {}).items():
++            if isinstance(value, dict) and value.get("status") in {"ai_suggested", "unresolved"}:
++                unresolved.append(f"scene_briefs[{index}].{path}")
++    if unresolved:
++        raise AppError(
++            "PLAN_NOT_ACCEPTED",
++            "candidate contains unconfirmed fields",
++            details={"field_paths": unresolved},
++        )
+     plan.status = "accepted"
+     if link is None:
+         session.add(
+@@ -112,6 +323,11 @@ def accept_chapter_plan_revision(
+         link.plan_revision_id = plan.id
+         link.plan_version = plan.plan_version
+     session.flush()
++    # 接受命令在同一事务内固定场景映射并准备 outbox。
++    # 兼容初始化计划可能只有 chapter_contract.scenes，因此这里保留该回退。
++    scene_specs = plan.scene_briefs or (plan.chapter_contract or {}).get("scenes") or []
++    if scene_specs:
++        materialize_chapter_plan(session, chapter_id, plan.id, scene_specs, ctx)
+     return plan
+ 
+ 
+@@ -131,26 +347,331 @@ def materialize_chapter_plan(
+         raise AppError("PLAN_NOT_ACCEPTED", "plan must be accepted before materialization")
+ 
+     mapping: dict[str, str] = {}
+-    for spec in scene_specs:
++    existing_links = {
++        row.client_key: row
++        for row in session.execute(
++            select(ChapterPlanSceneLink).where(ChapterPlanSceneLink.plan_revision_id == plan_revision_id)
++        ).scalars()
++    }
++    for sort_order, spec in enumerate(scene_specs):
+         client_key = spec.get("client_key")
+         if not client_key:
+             raise AppError("PLAN_REVISION_CONFLICT", "scene spec requires a client_key")
+         if client_key in mapping:
+             raise AppError("PLAN_REVISION_CONFLICT", "duplicate client_key in scene specs")
+-        if spec.get("scene_id"):
+-            mapping[client_key] = spec["scene_id"]
++        if client_key in existing_links:
++            mapping[client_key] = existing_links[client_key].scene_id
+             continue
+-        scene = Scene(
+-            chapter_id=chapter_id,
+-            title=spec.get("title", client_key),
+-            scene_brief=spec.get("scene_brief", {}),
+-        )
+-        session.add(scene)
+-        session.flush()
++        scene_id = spec.get("scene_id")
++        scene = session.get(Scene, scene_id) if scene_id else None
++        if scene is None:
++            scene = Scene(
++                chapter_id=chapter_id,
++                title=spec.get("title", client_key),
++                scene_brief=spec.get("scene_brief", spec.get("brief", {})),
++            )
++            session.add(scene)
++            session.flush()
++        elif scene.chapter_id != chapter_id:
++            raise AppError("PLAN_REVISION_CONFLICT", "scene does not belong to chapter")
+         mapping[client_key] = scene.id
++        session.add(
++            ChapterPlanSceneLink(
++                chapter_id=chapter_id,
++                plan_revision_id=plan_revision_id,
++                client_key=client_key,
++                scene_id=scene.id,
++                sort_order=sort_order,
++            )
++        )
++    # accepted pointer 与场景映射在同一事务中发出，消费者只按固定映射入队。
++    from ..runtime.outbox import PostgresRunOutbox
++
++    producer = ctx.get("manual_command_id") or ctx.get("idempotency_key") or "chapter-plan-accept"
++    run_id = ctx.get("generation_run_id")
++    if run_id is not None and session.get(GenerationRun, run_id) is None:
++        run_id = None
++    PostgresRunOutbox(session).enqueue(
++        {
++            "resource_type": "chapter_plan",
++            "resource_id": plan_revision_id,
++            "payload_schema": "chapter-plan.v1",
++            "payload": {
++                "event_type": "chapter_plan.accepted",
++                "chapter_id": chapter_id,
++                "plan_revision_id": plan_revision_id,
++                "scene_mapping": mapping,
++            },
++            "producer_command_id": producer,
++            "generation_run_id": run_id,
++        },
++        fencing_token=(ctx.get("write_fence") or {}).get("fencing_token", 0),
++    )
+     return mapping
+ 
+ 
++def chapter_workflow_read(session: Session, chapter_id: str) -> dict:
++    """组合读取章节规划、讨论、固定场景映射和活动运行状态。"""
++    chapter = session.get(Chapter, chapter_id)
++    if chapter is None:
++        raise AppError("CONTEXT_SOURCE_UNAVAILABLE", "chapter not found")
++    accepted_link = session.execute(
++        select(ChapterPlanRevisionLink).where(ChapterPlanRevisionLink.chapter_id == chapter_id)
++    ).scalar_one_or_none()
++    accepted = session.get(ChapterPlanRevision, accepted_link.plan_revision_id) if accepted_link else None
++    blocking: list[str] = []
++    if accepted_link is not None and accepted is None:
++        blocking.append(f"accepted_plan_missing:{accepted_link.plan_revision_id}")
++    elif accepted_link is not None and accepted.status != "accepted":
++        blocking.append(f"accepted_plan_not_accepted:{accepted.id}")
++    candidate = session.execute(
++        select(ChapterPlanRevision)
++        .where(ChapterPlanRevision.chapter_id == chapter_id, ChapterPlanRevision.status == "pending")
++        .order_by(ChapterPlanRevision.candidate_version.desc(), ChapterPlanRevision.created_at.desc())
++        .limit(1)
++    ).scalar_one_or_none()
++    lineage = (candidate or accepted)
++    lineage_id = lineage.planning_lineage_id if lineage and lineage.planning_lineage_id else chapter_id
++
++    messages = session.execute(
++        select(ChapterPlanDiscussionMessage)
++        .where(ChapterPlanDiscussionMessage.planning_lineage_id == lineage_id)
++        .order_by(ChapterPlanDiscussionMessage.message_sequence)
++    ).scalars().all()
++    questions = session.execute(
++        select(ChapterPlanQuestion)
++        .where(ChapterPlanQuestion.planning_lineage_id == lineage_id, ChapterPlanQuestion.status == "pending")
++        .order_by(ChapterPlanQuestion.created_at)
++    ).scalars().all()
++    proposals = session.execute(
++        select(ChapterPlanProposal)
++        .where(ChapterPlanProposal.planning_lineage_id == lineage_id)
++        .order_by(ChapterPlanProposal.created_at)
++    ).scalars().all()
++    all_runs = session.execute(
++        select(GenerationRun)
++        .where(GenerationRun.chapter_id == chapter_id)
++        .where(GenerationRun.status.not_in(("accepted", "cancelled", "failed", "superseded")))
++        .order_by(GenerationRun.created_at.desc())
++    ).scalars().all()
++    # 场景运行必须属于当前 accepted plan；旧计划运行仍可审计，但不能冒充当前活动运行。
++    runs = [
++        run
++        for run in all_runs
++        if run.scene_id is None
++        or (accepted is not None and run.plan_revision_id == accepted.id)
++    ]
++    if len(runs) > 1:
++        blocking.append("multiple_active_runs")
++    active = runs[0] if len(runs) == 1 else None
++    run_snapshot = None
++    if active is not None:
++        run_snapshot = {
++            "run_id": active.id,
++            "thread_id": active.id,
++            "project_id": active.project_id,
++            "target_id": active.scene_id or active.chapter_id or "",
++            "run_scope": "scene" if active.scene_id else "chapter",
++            "request_type": active.request_type or "continue",
++            "plan_revision_id": active.plan_revision_id,
++            "base_scene_revision_id": (active.normalized_input or {}).get("base_scene_revision_id"),
++            "status": active.status,
++            "run_version": active.run_version,
++            "current_scene_id": active.scene_id,
++            "current_node": active.last_durable_node,
++            "pending_node": active.pending_node,
++            "pause_reason": active.pause_reason,
++            "clarification_questions": active.clarification_questions or [],
++            "last_error_code": active.last_error_code,
++            "decision_target": active.decision_target,
++        }
++    links = []
++    if accepted is not None:
++        links = session.execute(
++            select(ChapterPlanSceneLink)
++            .where(ChapterPlanSceneLink.plan_revision_id == accepted.id)
++            .order_by(ChapterPlanSceneLink.sort_order)
++        ).scalars().all()
++        linked_keys = {link.client_key for link in links}
++        for brief in accepted.scene_briefs or []:
++            client_key = brief.get("client_key")
++            if client_key and client_key not in linked_keys:
++                blocking.append(f"scene_mapping_missing:{client_key}")
++    scene_rows = {s.id: s for s in session.execute(select(Scene).where(Scene.chapter_id == chapter_id)).scalars().all()}
++    scene_views = []
++    for link_index, link in enumerate(links):
++        scene = scene_rows.get(link.scene_id)
++        if scene is None:
++            blocking.append(f"scene_missing:{link.scene_id}")
++            continue
++        scene_run = session.execute(
++            select(GenerationRun)
++            .where(GenerationRun.scene_id == scene.id)
++            .where(GenerationRun.plan_revision_id == (accepted.id if accepted else None))
++            .where(GenerationRun.status.not_in(("accepted", "cancelled", "failed", "superseded")))
++            .order_by(GenerationRun.created_at.desc())
++            .limit(1)
++        ).scalar_one_or_none()
++        scene_blocking: list[str] = []
++        if link_index > 0:
++            previous_links = links[:link_index]
++            if any(scene_rows.get(prev.scene_id) is None or scene_rows[prev.scene_id].accepted_scene_revision_id is None for prev in previous_links):
++                scene_blocking.append("previous_scene_not_accepted")
++        if scene_run is not None and scene_run.plan_revision_id != accepted.id:
++            scene_blocking.append("scene_plan_mismatch")
++        for reason in scene_blocking:
++            blocking.append(f"scene_blocked:{scene.id}:{reason}")
++        scene_views.append(
++            {
++                "scene_id": scene.id,
++                "order": link.sort_order,
++                "title": scene.title,
++                "status": (scene_run.status if scene_run else ("accepted" if scene.accepted_scene_revision_id else "planned")),
++                "accepted_revision_id": scene.accepted_scene_revision_id,
++                "current_run_id": scene_run.id if scene_run else None,
++                "blocking_reasons": scene_blocking,
++            }
++        )
++    if blocking:
++        phase = "blocked"
++    elif active is not None and active.decision_target == "plan":
++        phase = "plan_feedback" if active.status in ("waiting_feedback", "pending_clarification") else "planning"
++    elif accepted is None:
++        phase = "intent_required" if not (chapter.chapter_intent or {}).get("text", "").strip() else "planning"
++    elif any(v["status"] in {"waiting_feedback", "pending_clarification"} for v in scene_views):
++        phase = "scene_feedback"
++    elif scene_views and any(v["status"] != "accepted" for v in scene_views):
++        phase = "scene_generation"
++    else:
++        phase = "completed" if chapter.accepted_chapter_revision_id else "chapter_review"
++    pending_decision = {"target": None, "kind": None, "run_id": None, "expected_run_version": None}
++    if active is not None:
++        target = active.decision_target
++        pending_decision.update(
++            {
++                "target": target,
++                "run_id": active.id,
++                "expected_run_version": active.run_version,
++                "kind": "accept_plan" if target == "plan" and active.status == "waiting_feedback" else (
++                    "answer_planner" if target == "plan" else "answer_scene" if target == "scene" else "chapter_feedback"
++                ),
++            }
++        )
++    elif candidate is not None:
++        pending_decision["kind"] = "accept_plan"
++        pending_decision["target"] = "plan"
++    revision_rows = session.execute(
++        select(ChapterRevision)
++        .where(ChapterRevision.chapter_id == chapter_id)
++        .order_by(ChapterRevision.created_at.desc())
++    ).scalars().all()
++    staged_revision = next((row for row in revision_rows if row.status == "staged"), None)
++    revision_history = []
++    for row in revision_rows:
++        revision_history.append(
++            {
++                "id": row.id,
++                "parent_revision_id": row.parent_revision_id,
++                "status": row.status,
++                "reason": row.reason,
++                "created_at": row.created_at.isoformat(),
++                "scene_versions": [
++                    {
++                        "scene_id": link.scene_id,
++                        "scene_revision_id": link.scene_revision_id,
++                        "sort_order": link.sort_order,
++                    }
++                    for link in session.execute(
++                        select(ChapterRevisionScene)
++                        .where(ChapterRevisionScene.chapter_revision_id == row.id)
++                        .order_by(ChapterRevisionScene.sort_order)
++                    ).scalars()
++                ],
++                "review_issues": row.review_issues or [],
++                "review_summary": row.review_summary or {},
++                "is_current_accepted": row.id == chapter.accepted_chapter_revision_id,
++            }
++        )
++    return {
++        "chapter_id": chapter_id,
++        "phase": phase,
++        "chapter_status": chapter.chapter_sync_status or "draft",
++        "pending_decision": pending_decision,
++        "intent": {
++            "text": (chapter.chapter_intent or {}).get("text", ""),
++            "optional_fields": chapter.chapter_intent or {},
++            "unresolved_questions": [q.text for q in questions],
++        },
++        "plan_discussion": {
++            "messages": [
++                {
++                    "message_id": m.message_id,
++                    "message_sequence": m.message_sequence,
++                    "role": m.role,
++                    "agent": m.agent,
++                    "kind": m.kind,
++                    "text": m.text,
++                    "created_at": m.created_at.isoformat(),
++                    "source_run_id": m.source_run_id,
++                    "parent_run_id": m.parent_run_id,
++                    "supersedes_run_id": m.supersedes_run_id,
++                    "checkpoint_id": m.checkpoint_id,
++                }
++                for m in messages
++            ],
++            "pending_questions": [
++                {"question_id": q.question_id, "text": q.text, "impact": q.impact} for q in questions
++            ],
++            "pending_proposals": [
++                {
++                    "proposal_id": p.proposal_id,
++                    "field_path": p.field_path,
++                    "value": p.value,
++                    "source": p.source,
++                    "status": p.status,
++                    "rationale": p.rationale,
++                }
++                for p in proposals
++                if p.status == "pending"
++            ],
++        },
++        "plan": {
++            "candidate_revision_id": candidate.id if candidate else None,
++            "accepted_revision_id": accepted.id if accepted else None,
++            "candidate_version": candidate.candidate_version if candidate else None,
++            "accepted_version": accepted_link.plan_version if accepted_link else None,
++            "status": "accepted" if accepted else "candidate" if candidate else "none",
++            "contract": (candidate or accepted).chapter_contract if (candidate or accepted) else None,
++            "contract_field_provenance": (candidate or accepted).contract_field_provenance if (candidate or accepted) else {},
++            "scene_briefs": [
++                {
++                    "client_key": b.get("client_key", ""),
++                    "order": i,
++                    "title": b.get("title", b.get("client_key", "")),
++                    "brief": b.get("scene_brief", b.get("brief", {})),
++                    "field_provenance": b.get("field_provenance", {}),
++                    "status": "accepted" if accepted else "proposed",
++                }
++                for i, b in enumerate((candidate or accepted).scene_briefs if (candidate or accepted) else [])
++            ],
++        },
++        "scenes": scene_views,
++        "chapter_revision": {
++            "staged_revision_id": staged_revision.id if staged_revision else None,
++            "accepted_revision_id": chapter.accepted_chapter_revision_id,
++            "review_run_id": staged_revision.review_run_id if staged_revision else None,
++            "review_issues": staged_revision.review_issues if staged_revision else [],
++            "review_summary": staged_revision.review_summary if staged_revision else {},
++            "history": revision_history,
++        },
++        "active_run": run_snapshot,
++        "affected_scene_ids": list((active.normalized_input or {}).get("affected_scene_ids", [])) if active else [],
++        "stale_scene_ids": list((active.normalized_input or {}).get("stale_scene_ids", [])) if active else [],
++        "blocking_reasons": blocking,
++        "canon_run_id": None,
++    }
++
++
+ def aggregate_chapter_revision(
+     session: Session,
+     chapter_id: str,
+@@ -158,15 +679,82 @@ def aggregate_chapter_revision(
+     reason: str,
+     ctx: CommandContext,
+ ) -> ChapterRevision:
+-    """Persist a chapter revision with a fixed scene revision list (primitive only)."""
+-    rev = ChapterRevision(chapter_id=chapter_id, parent_revision_id=None, status="staged", reason=reason)
++    """按 accepted plan 固化场景版本，生成不可变的 staged 章节版本。
++
++    `scene_revision_ids` 为空时仅在计划没有场景时允许；有计划场景时会从
++    当前 accepted scene pointer 读取并再次校验。这样可避免把草稿或旧基线
++    混入章节版本，后续提交才能进行确定性的 CAS 检查。
++    """
++    chapter = session.get(Chapter, chapter_id)
++    if chapter is None:
++        raise AppError("CONTEXT_SOURCE_UNAVAILABLE", "chapter not found")
++
++    plan_link = session.execute(
++        select(ChapterPlanRevisionLink).where(
++            ChapterPlanRevisionLink.chapter_id == chapter_id
++        )
++    ).scalar_one_or_none()
++    expected_scene_ids: list[str] = []
++    if plan_link is not None:
++        plan = session.get(ChapterPlanRevision, plan_link.plan_revision_id)
++        if plan is None or plan.status != "accepted":
++            raise AppError("PLAN_NOT_ACCEPTED", "accepted plan is required before aggregation")
++        expected_scene_ids = [
++            row.scene_id
++            for row in session.execute(
++                select(ChapterPlanSceneLink)
++                .where(ChapterPlanSceneLink.plan_revision_id == plan.id)
++                .order_by(ChapterPlanSceneLink.sort_order)
++            ).scalars()
++        ]
++
++    requested_ids = list(scene_revision_ids)
++    if not requested_ids and expected_scene_ids:
++        requested_ids = [
++            session.get(Scene, scene_id).accepted_scene_revision_id
++            if session.get(Scene, scene_id) is not None
++            else None
++            for scene_id in expected_scene_ids
++        ]
++        if any(revision_id is None for revision_id in requested_ids):
++            raise AppError("SCENE_NOT_ACCEPTED", "all scenes require an accepted scene revision")
++        requested_ids = [revision_id for revision_id in requested_ids if revision_id is not None]
++    if expected_scene_ids and len(requested_ids) != len(expected_scene_ids):
++        raise AppError("SCENE_NOT_ACCEPTED", "all planned scenes require accepted scene revisions")
++
++    fixed_links: list[tuple[str, str]] = []
++    seen_scenes: set[str] = set()
++    for scene_revision_id in requested_ids:
++        scene_revision = session.get(SceneRevision, scene_revision_id)
++        if scene_revision is None or scene_revision.status != "accepted":
++            raise AppError("SCENE_NOT_ACCEPTED", "accepted scene revision is required")
++        scene = session.get(Scene, scene_revision.scene_id)
++        if scene is None or scene.chapter_id != chapter_id:
++            raise AppError("SCENE_NOT_ACCEPTED", "scene revision does not belong to the chapter")
++        if scene.accepted_scene_revision_id is None:
++            raise AppError("SCENE_NOT_ACCEPTED", "accepted scene revision is required")
++        if scene.accepted_scene_revision_id != scene_revision.id:
++            raise AppError("SCENE_STALE", "scene baseline changed before aggregation")
++        if scene.id in seen_scenes:
++            raise AppError("SCENE_NOT_ACCEPTED", "a scene may appear only once in a chapter revision")
++        seen_scenes.add(scene.id)
++        fixed_links.append((scene.id, scene_revision.id))
++    if expected_scene_ids and [scene_id for scene_id, _ in fixed_links] != expected_scene_ids:
++        raise AppError("PLAN_REVISION_CONFLICT", "scene revisions do not match the accepted plan")
++
++    rev = ChapterRevision(
++        chapter_id=chapter_id,
++        parent_revision_id=chapter.accepted_chapter_revision_id,
++        status="staged",
++        reason=reason,
++    )
+     session.add(rev)
+     session.flush()
+-    for order, scene_rev_id in enumerate(scene_revision_ids):
++    for order, (scene_id, scene_rev_id) in enumerate(fixed_links):
+         session.add(
+             ChapterRevisionScene(
+                 chapter_revision_id=rev.id,
+-                scene_id="",
++                scene_id=scene_id,
+                 scene_revision_id=scene_rev_id,
+                 sort_order=order,
+             )
+@@ -180,14 +768,40 @@ def commit_chapter_version(
+     chapter_revision_id: str,
+     ctx: CommandContext,
+ ) -> ChapterRevision:
+-    rev = session.get(ChapterRevision, chapter_revision_id)
+-    if rev is None or rev.status != "staged":
++    rev = session.execute(
++        select(ChapterRevision)
++        .where(ChapterRevision.id == chapter_revision_id)
++        .with_for_update()
++    ).scalar_one_or_none()
++    if rev is None:
++        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter revision does not exist")
++    chapter = session.execute(
++        select(Chapter).where(Chapter.id == rev.chapter_id).with_for_update()
++    ).scalar_one_or_none()
++    if chapter is None:
++        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter does not exist")
++    if rev.status == "accepted":
++        if chapter.accepted_chapter_revision_id == rev.id:
++            return rev
++        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter revision is no longer the accepted pointer")
++    if rev.status != "staged":
+         raise AppError("CHAPTER_OUT_OF_SYNC", "chapter revision is not staged")
++    expected_base = ctx.get("base_chapter_revision_id")
++    if expected_base is not None and expected_base != chapter.accepted_chapter_revision_id:
++        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter baseline is stale")
++    if chapter.chapter_sync_status in {"out_of_sync", "stale"} or chapter.entry_handoff_status not in (None, "in_sync"):
++        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter is out of sync")
++    for link in session.execute(
++        select(ChapterRevisionScene).where(
++            ChapterRevisionScene.chapter_revision_id == rev.id
++        )
++    ).scalars():
++        scene = session.get(Scene, link.scene_id)
++        if scene is None or scene.accepted_scene_revision_id != link.scene_revision_id:
++            raise AppError("CHAPTER_OUT_OF_SYNC", "scene baseline changed after aggregation")
+     rev.status = "accepted"
+-    chapter = session.get(Chapter, rev.chapter_id)
+-    if chapter is not None:
+-        chapter.accepted_chapter_revision_id = rev.id
+-        chapter.chapter_sync_status = "in_sync"
++    chapter.accepted_chapter_revision_id = rev.id
++    chapter.chapter_sync_status = "in_sync"
+     session.flush()
+     # Task 5C：在权威的章节接受事务边界入队 chapter_revision.accepted outbox 事件。
+     # API、Worker、领域服务所有章节接受路径都经本函数，保证只入队一次；绝不在此
+@@ -210,7 +824,7 @@ def commit_chapter_version(
+                 "chapter_id": rev.chapter_id,
+                 "accepted_chapter_revision_id": rev.id,
+             },
+-            "producer_command_id": ctx.get("manual_command_id") or "chapter-accept",
++            "producer_command_id": ctx.get("manual_command_id") or ctx.get("idempotency_key") or f"chapter-accept:{rev.id}",
+             "generation_run_id": run_id,
+         },
+         fencing_token=0,
+@@ -230,7 +844,7 @@ def rollback_chapter_revision(
+     目标版本并记录作者决策，保证历史与审计可还原。目标版本必须属于该章节。
+     """
+     target = session.get(ChapterRevision, target_revision_id)
+-    if target is None or target.chapter_id != chapter_id:
++    if target is None or target.chapter_id != chapter_id or target.status != "accepted":
+         raise AppError("CHAPTER_OUT_OF_SYNC", "target revision does not belong to the chapter")
+     rev = ChapterRevision(
+         chapter_id=chapter_id,
+@@ -240,4 +854,49 @@ def rollback_chapter_revision(
+     )
+     session.add(rev)
+     session.flush()
++    for link in session.execute(
++        select(ChapterRevisionScene)
++        .where(ChapterRevisionScene.chapter_revision_id == target.id)
++        .order_by(ChapterRevisionScene.sort_order)
++    ).scalars():
++        session.add(
++            ChapterRevisionScene(
++                chapter_revision_id=rev.id,
++                scene_id=link.scene_id,
++                scene_revision_id=link.scene_revision_id,
++                sort_order=link.sort_order,
++            )
++        )
++    session.flush()
+     return rev
++
++
++def persist_chapter_review_output(
++    session: Session,
++    chapter_revision_id: str,
++    output: object,
++    ctx: CommandContext,
++) -> ChapterRevision:
++    """将 ChapterReviewAgent 的结构化结果写入 staged 版本。
++
++    审校写入与版本聚合在同一 Worker 事务内；只允许修改 staged 版本，避免
++    重放或旧 Worker 覆盖已经 accepted 的历史版本。
++    """
++    revision = session.execute(
++        select(ChapterRevision)
++        .where(ChapterRevision.id == chapter_revision_id)
++        .with_for_update()
++    ).scalar_one_or_none()
++    if revision is None or revision.status != "staged":
++        raise AppError("CHAPTER_OUT_OF_SYNC", "chapter review requires a staged revision")
++    data = output.model_dump() if hasattr(output, "model_dump") else dict(output)
++    revision.review_issues = list(data.get("review_issues") or [])
++    revision.review_summary = {
++        "status": data.get("status"),
++        "overall_rating": data.get("overall_rating", ""),
++        "submitted": bool(data.get("submitted")),
++        "clarification_questions": list(data.get("clarification_questions") or []),
++    }
++    revision.review_run_id = ctx.get("generation_run_id")
++    session.flush()
++    return revision
+diff --git a/backend/app/runtime/run_worker.py b/backend/app/runtime/run_worker.py
+index 969598c..7bc6faa 100644
+--- a/backend/app/runtime/run_worker.py
++++ b/backend/app/runtime/run_worker.py
+@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
+ 
+ from app.agents.canon_agent import CanonAgent
+ from app.agents.canon_graph import CanonGraph
++from app.agents.chapter_aggregator import ChapterAggregator
+ from app.agents.chapter_graph import ChapterGraph
+ from app.agents.chapter_planner import ChapterPlannerAgent
+ from app.agents.chapter_review_agent import ChapterReviewAgent
+@@ -39,18 +40,28 @@ from app.agents.schemas import (
+ from app.agents.state import ChapterRunState
+ from app.agents.writing_agent import WritingAgent
+ from app.db.models import (
++    Chapter,
++    ChapterPlanDiscussionMessage,
++    ChapterPlanProposal,
++    ChapterPlanQuestion,
+     ChapterPlanRevision,
+     ChapterPlanRevisionLink,
++    ChapterPlanSceneLink,
+     GenerationRun,
++    RunOutboxRecord,
+     Scene,
+     SceneRevision,
++    Volume,
+ )
++from app.domain.chapters import persist_chapter_review_output
+ from app.errors import AppError
+ from app.observability.wiring import ObservabilityWiring
+ from app.runtime.executor import RunExecutor
+ from app.runtime.leases import LeaseRepository
++from app.runtime.outbox import PostgresRunOutbox
+ from app.runtime.run_events import PostgresRunEventStore
+ from app.runtime.run_identity import RunIdentity
++from app.services.generation_runs import persist_planner_output
+ 
+ # 图构造器：给定运行与会话返回可执行图（默认按运行类型选择三图之一）。
+ GraphBuilder = Callable[[GenerationRun, Session], Any]
+@@ -94,6 +105,10 @@ class RunWorker:
+         返回：本次实际处理并提交的运行数量；无 queued 运行时返回 0。
+         约束：并发 worker 通过行锁领取，同一运行只被一个 worker 处理一次。
+         """
++        # 先恢复 accepted plan 产生的场景队列；tick 返回值仍表示实际执行的运行数。
++        self._consume_plan_outbox()
++        # outbox 只负责首次投递；后续场景由 accepted 状态恢复，避免 outbox 已消费后队列停滞。
++        self._recover_accepted_plan_scene_queues()
+         processed = 0
+         while True:
+             run_id = self._peek_queued()
+@@ -106,6 +121,232 @@ class RunWorker:
+             processed += 1
+         return processed
+ 
++    def _recover_accepted_plan_scene_queues(self) -> int:
++        """恢复 accepted plan 的下一个场景运行，严格保持计划顺序并可重复执行。"""
++        created = 0
++        with self._factory() as session:
++            accepted_plans = session.execute(
++                select(ChapterPlanRevisionLink)
++                .order_by(ChapterPlanRevisionLink.chapter_id, ChapterPlanRevisionLink.plan_revision_id)
++                .with_for_update(skip_locked=True)
++            ).scalars().all()
++            for accepted_link in accepted_plans:
++                if self._ensure_next_scene_run(
++                    session, accepted_link.chapter_id, accepted_link.plan_revision_id
++                ):
++                    created += 1
++            session.commit()
++        return created
++
++    def _ensure_next_scene_run(self, session: Session, chapter_id: str, plan_revision_id: str) -> bool:
++        """在单个 accepted plan 下最多创建一个当前可运行场景。"""
++        links = session.execute(
++            select(ChapterPlanSceneLink)
++            .where(
++                ChapterPlanSceneLink.chapter_id == chapter_id,
++                ChapterPlanSceneLink.plan_revision_id == plan_revision_id,
++            )
++            .order_by(ChapterPlanSceneLink.sort_order)
++            .with_for_update()
++        ).scalars().all()
++        for index, scene_link in enumerate(links):
++            existing = session.execute(
++                select(GenerationRun)
++                .where(
++                    GenerationRun.chapter_id == chapter_id,
++                    GenerationRun.scene_id == scene_link.scene_id,
++                    GenerationRun.plan_revision_id == plan_revision_id,
++                )
++                .order_by(GenerationRun.created_at.desc())
++                .with_for_update()
++            ).scalars().first()
++            if existing is not None:
++                if existing.status != "accepted":
++                    return False
++                continue
++            if index > 0:
++                previous = links[index - 1]
++                previous_scene = session.get(Scene, previous.scene_id)
++                previous_run = session.execute(
++                    select(GenerationRun)
++                    .where(
++                        GenerationRun.chapter_id == chapter_id,
++                        GenerationRun.scene_id == previous.scene_id,
++                        GenerationRun.plan_revision_id == plan_revision_id,
++                    )
++                    .order_by(GenerationRun.created_at.desc())
++                    .with_for_update()
++                ).scalars().first()
++                if (
++                    previous_scene is None
++                    or previous_scene.accepted_scene_revision_id is None
++                    or previous_run is None
++                    or previous_run.status != "accepted"
++                ):
++                    return False
++            chapter = session.get(Chapter, chapter_id)
++            if chapter is None:
++                return False
++            volume = session.get(Volume, chapter.volume_id)
++            scene = session.get(Scene, scene_link.scene_id)
++            base_scene_revision_id = scene.accepted_scene_revision_id if scene is not None else None
++            run = GenerationRun(
++                project_id=volume.project_id if volume is not None else chapter.volume_id,
++                chapter_id=chapter_id,
++                scene_id=scene_link.scene_id,
++                plan_revision_id=plan_revision_id,
++                request_type="continue",
++                decision_target="scene",
++                status="queued",
++                normalized_input={
++                    "run_scope": "scene",
++                    "request_type": "continue",
++                    "decision_target": "scene",
++                    "plan_revision_id": plan_revision_id,
++                    "base_scene_revision_id": base_scene_revision_id,
++                    "chapter_intent": chapter.chapter_intent or {},
++                },
++            )
++            session.add(run)
++            session.flush()
++            PostgresRunEventStore(session).emit(
++                run.id,
++                "run_queued",
++                {
++                    "run_scope": "scene",
++                    "request_type": "continue",
++                    "plan_revision_id": plan_revision_id,
++                    "base_scene_revision_id": base_scene_revision_id,
++                },
++                fencing_token=0,
++            )
++            PostgresRunOutbox(session).enqueue(
++                {
++                    "resource_type": "run",
++                    "resource_id": run.id,
++                    "payload_schema": "run-event.v1",
++                    "payload": {"event_type": "run_queued", "run_id": run.id},
++                    "producer_command_id": run.id,
++                    "generation_run_id": run.id,
++                },
++                fencing_token=0,
++            )
++            return True
++        return False
++
++    def _consume_plan_outbox(self) -> int:
++        """消费 accepted plan 事件并恢复第一个未完成场景。
++
++        outbox 记录本身是可重放的；场景运行通过固定 `(plan_revision_id, scene_id)`
++        查重，因此 Worker 重启或重复投递不会创建第二个场景运行。
++        """
++        consumed = 0
++        with self._factory() as session:
++            rows = session.execute(
++                select(RunOutboxRecord)
++                .where(
++                    RunOutboxRecord.resource_type == "chapter_plan",
++                    RunOutboxRecord.delivery_status.in_(("pending", "publishing", "published", "consumed")),
++                )
++                .order_by(RunOutboxRecord.created_at)
++                .with_for_update(skip_locked=True)
++            ).scalars().all()
++            for record in rows:
++                payload = record.payload or {}
++                if payload.get("event_type") != "chapter_plan.accepted":
++                    continue
++                chapter_id = payload.get("chapter_id")
++                plan_revision_id = payload.get("plan_revision_id")
++                if not chapter_id or not plan_revision_id:
++                    record.delivery_status = "failed"
++                    record.last_error = "invalid chapter_plan.accepted payload"
++                    continue
++                accepted_link = session.execute(
++                    select(ChapterPlanRevisionLink)
++                    .where(ChapterPlanRevisionLink.chapter_id == chapter_id)
++                    .with_for_update()
++                ).scalar_one_or_none()
++                if accepted_link is None or accepted_link.plan_revision_id != plan_revision_id:
++                    record.delivery_status = "failed"
++                    record.last_error = "accepted plan pointer does not match outbox payload"
++                    continue
++                # accepted-plan 重放复用直接入队的顺序与基线校验，避免旁路创建后续场景。
++                self._ensure_next_scene_run(session, chapter_id, plan_revision_id)
++                record.delivery_status = "consumed"
++                consumed += 1
++                continue
++                link = session.execute(
++                    select(ChapterPlanSceneLink)
++                    .where(ChapterPlanSceneLink.plan_revision_id == plan_revision_id)
++                    .order_by(ChapterPlanSceneLink.sort_order)
++                ).scalars().all()
++                for scene_link in link:
++                    existing_run = session.execute(
++                        select(GenerationRun)
++                        .where(
++                            GenerationRun.chapter_id == chapter_id,
++                            GenerationRun.scene_id == scene_link.scene_id,
++                            GenerationRun.plan_revision_id == plan_revision_id,
++                        )
++                        .limit(1)
++                    ).scalar_one_or_none()
++                    if existing_run is not None:
++                        # 只有已接受的场景才推进队列；暂停/运行中的首场景阻止
++                        # 后续场景物化，避免 outbox 重放制造并行场景运行。
++                        if existing_run.status != "accepted":
++                            break
++                        continue
++                    chapter = session.get(Chapter, chapter_id)
++                    if chapter is None:
++                        record.delivery_status = "failed"
++                        record.last_error = "chapter not found"
++                        break
++                    volume = session.get(Volume, chapter.volume_id)
++                    scene = session.get(Scene, scene_link.scene_id)
++                    base_scene_revision_id = scene.accepted_scene_revision_id if scene is not None else None
++                    run = GenerationRun(
++                        project_id=volume.project_id if volume is not None else chapter.volume_id,
++                        chapter_id=chapter_id,
++                        scene_id=scene_link.scene_id,
++                        plan_revision_id=plan_revision_id,
++                        request_type="continue",
++                        decision_target="scene",
++                        status="queued",
++                        normalized_input={
++                            "run_scope": "scene",
++                            "request_type": "continue",
++                            "decision_target": "scene",
++                            "plan_revision_id": plan_revision_id,
++                            "base_scene_revision_id": base_scene_revision_id,
++                            "chapter_intent": chapter.chapter_intent or {},
++                        },
++                    )
++                    session.add(run)
++                    session.flush()
++                    PostgresRunEventStore(session).emit(
++                        run.id,
++                        "run_queued",
++                        {"run_scope": "scene", "request_type": "continue", "plan_revision_id": plan_revision_id},
++                        fencing_token=0,
++                        producer_command_id=record.producer_command_id,
++                    )
++                    PostgresRunOutbox(session).enqueue(
++                        {
++                            "resource_type": "run",
++                            "resource_id": run.id,
++                            "payload_schema": "run-event.v1",
++                            "payload": {"event_type": "run_queued", "run_id": run.id},
++                            "producer_command_id": run.id,
++                            "generation_run_id": run.id,
++                        },
++                        fencing_token=0,
++                    )
++                    break
++                record.delivery_status = "consumed"
++                consumed += 1
++            session.commit()
++        return consumed
++
+     def run_forever(self, interval: float = 1.0) -> None:
+         """持续轮询执行（Worker 进程主循环）。
+ 
+@@ -143,6 +384,27 @@ class RunWorker:
+         ).scalar_one_or_none()
+         if run is None:
+             return False
++        if run.scene_id is not None and run.plan_revision_id is not None and run.chapter_id is not None:
++            accepted_link = session.execute(
++                select(ChapterPlanRevisionLink)
++                .where(ChapterPlanRevisionLink.chapter_id == run.chapter_id)
++                .with_for_update()
++            ).scalar_one_or_none()
++            if accepted_link is None or accepted_link.plan_revision_id != run.plan_revision_id:
++                # 计划替换后，旧 queued 场景 run 只能进入终态，不能领取租约或构建 graph。
++                run.status = "superseded"
++                run.run_version += 1
++                run.last_error_code = "PLAN_REVISION_CONFLICT"
++                session.flush()
++                PostgresRunEventStore(session).emit(
++                    run.id,
++                    "run_superseded",
++                    {"error_code": "PLAN_REVISION_CONFLICT"},
++                    fencing_token=run.write_fencing_token,
++                    producer_command_id=self._worker_id,
++                )
++                session.commit()
++                return True
+         identity = self._identity_for(run)
+         leases = LeaseRepository(session)
+         lease = leases.claim(identity, self._worker_id)
+@@ -161,6 +423,24 @@ class RunWorker:
+                 state,
+                 envelope,
+             )
++            planner_output = result.get("planner_output")
++            if planner_output is not None and run.chapter_id and run.decision_target == "plan":
++                from app.agents.schemas import ChapterPlanOutput
++
++                persist_planner_output(session, run.id, ChapterPlanOutput(**planner_output), actor_id=self._actor_id)
++            staged_revision_id = result.get("staged_chapter_revision_id")
++            review_output = result.get("chapter_review_output")
++            if staged_revision_id and review_output:
++                from app.agents.schemas import ChapterReviewOutput
++
++                persist_chapter_review_output(
++                    session,
++                    staged_revision_id,
++                    ChapterReviewOutput(**review_output),
++                    {
++                        "generation_run_id": run.id,
++                    },
++                )
+             self._persist_outcome(session, run, result)
+             session.commit()
+         except Exception as exc:
+@@ -292,18 +572,49 @@ class RunWorker:
+         绝不重新读取客户端输入。
+         """
+         ni = run.normalized_input or {}
++        chapter_intent = ni.get("chapter_intent") or {}
++        if run.chapter_id:
++            chapter = session.get(Chapter, run.chapter_id)
++            if chapter is not None:
++                persisted_intent = chapter.chapter_intent or {}
++                # 旧初始化数据可能只有占位键；只有包含自然语言 text 才作为 Planner 意图。
++                if not chapter_intent.get("text") and persisted_intent.get("text"):
++                    chapter_intent = persisted_intent
+         scene_brief: dict = {}
+         accepted_text = ""
+         accepted_scene_revision_id: str | None = None
+         if run.scene_id:
+             scene = session.get(Scene, run.scene_id)
+             if scene is not None:
+-                scene_brief = scene.scene_brief or {}
+-                if scene.accepted_scene_revision_id:
+-                    accepted_scene_revision_id = scene.accepted_scene_revision_id
+-                    rev = session.get(SceneRevision, scene.accepted_scene_revision_id)
++                persisted_base = scene.accepted_scene_revision_id
++                expected_base = ni.get("base_scene_revision_id")
++                if expected_base != persisted_base:
++                    raise AppError("SCENE_STALE", "scene baseline is stale; refresh and retry")
++                accepted_scene_revision_id = persisted_base
++                if persisted_base:
++                    rev = session.get(SceneRevision, persisted_base)
+                     if rev is not None and isinstance(rev.content, str):
+                         accepted_text = rev.content
++                # accepted plan 的 scene brief 是运行创建时的固定输入，不能随旧 Scene 编辑变化。
++                scene_brief = {} if run.plan_revision_id else (scene.scene_brief or {})
++                if run.plan_revision_id:
++                    plan = session.get(ChapterPlanRevision, run.plan_revision_id)
++                    link = session.execute(
++                        select(ChapterPlanSceneLink).where(
++                            ChapterPlanSceneLink.plan_revision_id == run.plan_revision_id,
++                            ChapterPlanSceneLink.scene_id == run.scene_id,
++                        )
++                    ).scalar_one_or_none()
++                    specs = (plan.scene_briefs if plan is not None else None) or (
++                        (plan.chapter_contract or {}).get("scenes", []) if plan is not None else []
++                    )
++                    if link is not None:
++                        fixed_spec = next(
++                            (item for item in specs if item.get("client_key") == link.client_key),
++                            None,
++                        )
++                        if fixed_spec is not None:
++                            scene_brief = fixed_spec.get("scene_brief", fixed_spec.get("brief", {})) or {}
+         accepted_chapter_revision_id: str | None = None
+         if run.decision_target == "canon" and run.canon_source_revision_id:
+             if run.scene_id:
+@@ -312,6 +623,36 @@ class RunWorker:
+                 accepted_chapter_revision_id = run.canon_source_revision_id
+         base_scene_revision_id = ni.get("base_scene_revision_id")
+         chapter_contract = self._chapter_contract_for(session, run)
++        is_planner_run = run.chapter_id is not None and run.decision_target == "plan"
++        lineage = self._planning_lineage_for(session, run) if is_planner_run else None
++        discussion: list[dict] = []
++        questions: list[dict] = []
++        proposals: list[dict] = []
++        if is_planner_run and lineage:
++            discussion = [
++                {"role": row.role, "kind": row.kind, "text": row.text, "source_run_id": row.source_run_id}
++                for row in session.execute(
++                    select(ChapterPlanDiscussionMessage)
++                    .where(ChapterPlanDiscussionMessage.planning_lineage_id == lineage)
++                    .order_by(ChapterPlanDiscussionMessage.message_sequence)
++                ).scalars()
++            ]
++            questions = [
++                {"question_id": row.question_id, "text": row.text, "impact": row.impact, "status": row.status}
++                for row in session.execute(
++                    select(ChapterPlanQuestion)
++                    .where(ChapterPlanQuestion.planning_lineage_id == lineage, ChapterPlanQuestion.status == "pending")
++                    .order_by(ChapterPlanQuestion.created_at)
++                ).scalars()
++            ]
++            proposals = [
++                {"proposal_id": row.proposal_id, "field_path": row.field_path, "value": row.value, "source": row.source, "status": row.status}
++                for row in session.execute(
++                    select(ChapterPlanProposal)
++                    .where(ChapterPlanProposal.planning_lineage_id == lineage, ChapterPlanProposal.status == "pending")
++                    .order_by(ChapterPlanProposal.created_at)
++                ).scalars()
++            ]
+         manifest = [
+             ContextManifestEntry(source_id=rid, kind="revision", revision_id=rid)
+             for rid in dict.fromkeys([base_scene_revision_id, accepted_scene_revision_id])
+@@ -345,6 +686,10 @@ class RunWorker:
+             accepted_scene_revision_id=accepted_scene_revision_id,
+             accepted_chapter_revision_id=accepted_chapter_revision_id,
+             chapter_contract=chapter_contract,
++            chapter_intent=chapter_intent if is_planner_run else {},
++            plan_discussion=discussion if is_planner_run else [],
++            pending_plan_questions=questions if is_planner_run else [],
++            pending_plan_proposals=proposals if is_planner_run else [],
+             canon_scope=(
+                 ("scene" if run.scene_id else "chapter")
+                 if run.decision_target == "canon"
+@@ -360,6 +705,23 @@ class RunWorker:
+             write_fence_fencing_token=lease["fencing_token"],
+         )
+ 
++    def _planning_lineage_for(self, session: Session, run: GenerationRun) -> str | None:
++        """从持久化计划血缘恢复 Planner 讨论上下文。"""
++        value = (run.normalized_input or {}).get("planning_lineage_id")
++        if value:
++            return str(value)
++        if run.parent_plan_revision_id:
++            parent = session.get(ChapterPlanRevision, run.parent_plan_revision_id)
++            if parent is not None and parent.planning_lineage_id:
++                return parent.planning_lineage_id
++            return run.parent_plan_revision_id
++        candidate = session.execute(
++            select(ChapterPlanRevision)
++            .where(ChapterPlanRevision.source_run_id == run.id)
++            .limit(1)
++        ).scalar_one_or_none()
++        return candidate.planning_lineage_id if candidate else run.id
++
+     def _chapter_contract_for(self, session: Session, run: GenerationRun) -> dict:
+         """由已接受章节计划修订源取章节契约（供 ChapterPlanner/Review 使用）。
+ 
+@@ -411,6 +773,7 @@ class RunWorker:
+         ) == "chapter"
+         if is_chapter:
+             chapter_kwargs: dict[str, Any] = {}
++            chapter_kwargs["aggregator"] = ChapterAggregator(session)
+             if self._provider is not None:
+                 chapter_kwargs["planner"] = ChapterPlannerAgent(provider=self._provider)
+                 chapter_kwargs["review"] = ChapterReviewAgent(provider=self._provider)

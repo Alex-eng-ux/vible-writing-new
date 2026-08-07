@@ -50,7 +50,8 @@ class ChapterGraph:
     传入基于 Postgres 的 checkpointer。章节审校分支不会调用 WritingAgent。
     """
 
-    NODE_ORDER = [_PLAN, _REVIEW, _AGGREGATE]
+    # 章节审校运行的真实顺序是聚合后审校；规划运行在候选产出后交回工作流控制器。
+    NODE_ORDER = [_PLAN, _AGGREGATE, _REVIEW]
 
     def __init__(
         self,
@@ -105,21 +106,25 @@ class ChapterGraph:
         graph.add_node(_AGGREGATE, self._aggregate_node)
         graph.add_node(_PAUSE, self._pause_node)
 
-        graph.add_edge(START, _PLAN)
+        graph.add_conditional_edges(
+            START,
+            self._route_entry,
+            {_PLAN: _PLAN, _AGGREGATE: _AGGREGATE},
+        )
         graph.add_conditional_edges(
             _PLAN,
             self._route,
-            {_REVIEW: _REVIEW, _PAUSE: _PAUSE, END: END},
+            {_PAUSE: _PAUSE, END: END},
         )
         graph.add_conditional_edges(
             _REVIEW,
             self._route,
-            {_AGGREGATE: _AGGREGATE, _PAUSE: _PAUSE, END: END},
+            {_PAUSE: _PAUSE, END: END},
         )
         graph.add_conditional_edges(
             _AGGREGATE,
             self._route,
-            {_PAUSE: _PAUSE, END: END},
+            {_REVIEW: _REVIEW, _PAUSE: _PAUSE, END: END},
         )
         graph.add_conditional_edges(
             _PAUSE,
@@ -127,6 +132,21 @@ class ChapterGraph:
             {_PLAN: _PLAN, _REVIEW: _REVIEW, _AGGREGATE: _AGGREGATE, _PAUSE: _PAUSE, END: END},
         )
         return graph
+
+    def _is_post_scene_review_run(self) -> bool:
+        """识别场景队列完成后创建的章节审校运行。"""
+        envelope = self._current_envelope()
+        runtime = envelope.runtime_context
+        return (
+            envelope.request_type == "review"
+            and runtime.run_scope == "chapter"
+            and runtime.decision_target == "chapter"
+            and runtime.chapter_id is not None
+        )
+
+    def _route_entry(self, state: ChapterRunState) -> str:
+        """章节审校运行从聚合开始，普通章节规划运行仍从 Planner 开始。"""
+        return _AGGREGATE if self._is_post_scene_review_run() else _PLAN
 
     def _node(self, agent_type: str) -> Callable:
         """为指定 Agent 类型生成 LangGraph 节点执行函数（与 SceneGraph 同款）。"""
@@ -140,9 +160,53 @@ class ChapterGraph:
             feedback = state.get("author_feedback")
             if feedback:
                 envelope = envelope.model_copy(update={"author_feedback": feedback})
+            if agent_type == _REVIEW and self._aggregator is not None:
+                chapter_id = envelope.runtime_context.chapter_id
+                if chapter_id is not None:
+                    eligibility = self._aggregator.eligibility(
+                        chapter_id,
+                        envelope.entry_handoff_id,
+                        envelope.entry_source_chapter_revision_id,
+                        envelope.entry_handoff_chain_hash,
+                    )
+                    if not eligibility.eligible:
+                        state["pending_node"] = _REVIEW
+                        state["clarification_questions"] = [eligibility.reason]
+                        state["run_status"] = "paused"
+                        return {
+                            "pending_node": _REVIEW,
+                            "clarification_questions": [eligibility.reason],
+                            "run_status": "paused",
+                            "last_durable_node": _REVIEW,
+                            "error_code": eligibility.status,
+                        }
             result = callable_(state, envelope)
+            # Planner 候选只在 Worker 的持久化事务中提交；把结构化结果返回给 Worker，
+            # 不把正文或讨论写入观测 sink，也不把候选当作 accepted 版本。
+            planner_output = result.get("output") if agent_type == _PLAN else None
+            chapter_review_output = result.get("output") if agent_type == _REVIEW else None
             state["last_durable_node"] = result.get("last_durable_node") or agent_type
             outcome = result.get("outcome")
+            if (
+                agent_type == _PLAN
+                and envelope.request_type == "new_chapter"
+                and outcome is not None
+                and outcome.status == "continue"
+                and getattr(planner_output, "status", None) == "ready"
+            ):
+                # 首次规划只产生待作者确认的候选，不能沿旧 ChapterGraph
+                # 直接进入章节审校/聚合；接受计划后由领域事务和场景队列接管。
+                response = {
+                    "pending_node": _PLAN,
+                    "clarification_questions": [],
+                    "run_status": "paused",
+                    "last_durable_node": agent_type,
+                }
+                if planner_output is not None:
+                    response["planner_output"] = planner_output.model_dump()
+                if chapter_review_output is not None:
+                    response["chapter_review_output"] = chapter_review_output.model_dump()
+                return response
             if outcome is not None and outcome.status in (
                 "needs_clarification",
                 "feedback",
@@ -152,16 +216,27 @@ class ChapterGraph:
                 state["pending_node"] = outcome.pending_node
                 state["clarification_questions"] = outcome.clarification_questions
                 state["run_status"] = "paused"
-                return {
+                response = {
                     "pending_node": outcome.pending_node,
                     "clarification_questions": outcome.clarification_questions,
                     "run_status": "paused",
                     "last_durable_node": agent_type,
                 }
-            return {
+                if planner_output is not None:
+                    response["planner_output"] = planner_output.model_dump()
+                if chapter_review_output is not None:
+                    response["chapter_review_output"] = chapter_review_output.model_dump()
+                return response
+            response = {
                 "last_durable_node": agent_type,
                 "run_status": "running",
             }
+            if planner_output is not None:
+                response["planner_output"] = planner_output.model_dump()
+            if chapter_review_output is not None:
+                state["chapter_review_output"] = chapter_review_output.model_dump()
+                response["chapter_review_output"] = chapter_review_output.model_dump()
+            return response
 
         return run
 
@@ -200,7 +275,7 @@ class ChapterGraph:
                     "owner_id": envelope.write_fence_owner_id,
                     "fencing_token": envelope.write_fence_fencing_token,
                 }
-            self._aggregator.aggregate(
+            revision_id = self._aggregator.aggregate(
                 chapter_id,
                 reason="chapter aggregation",
                 ctx={
@@ -232,6 +307,7 @@ class ChapterGraph:
                     "expected_run_version": None,
                 },
             )
+            state["staged_chapter_revision_id"] = revision_id
         except AppError as exc:
             state["run_status"] = "paused"
             return {
@@ -244,6 +320,8 @@ class ChapterGraph:
         return {
             "last_durable_node": _AGGREGATE,
             "run_status": "running",
+            "staged_chapter_revision_id": state.get("staged_chapter_revision_id"),
+            "chapter_review_output": state.get("chapter_review_output"),
         }
 
     def _route_after_pause(self, state: ChapterRunState) -> str:
@@ -257,8 +335,16 @@ class ChapterGraph:
             return END
         if action == "accept":
             # accept 已保存 pending_node 到 last_durable_node，回到它继续执行。
+            # 规划候选被接受后由 workflow controller 驱动场景队列，图内不得再次执行 Planner。
+            last = state.get("last_durable_node")
+            if last == _PLAN and not self._is_post_scene_review_run():
+                return END
+            if last in (_REVIEW, _AGGREGATE) and not self._is_post_scene_review_run():
+                return END
             return state.get("last_durable_node") or END
         if action == "feedback":
+            if state.get("pending_node") in (_REVIEW, _AGGREGATE) and not self._is_post_scene_review_run():
+                return END
             return state.get("pending_node") or END
         return END
 
@@ -267,10 +353,10 @@ class ChapterGraph:
         if state.get("pending_node") is not None:
             return _PAUSE
         last = state.get("last_durable_node")
-        if last == _PLAN:
-            return _REVIEW
         if last == _REVIEW:
-            return _AGGREGATE
+            return END
+        if last == _AGGREGATE and self._is_post_scene_review_run():
+            return _REVIEW
         return END
 
     def _pause_node(self, state: ChapterRunState, config: RunnableConfig) -> dict:
@@ -354,8 +440,44 @@ class ChapterGraph:
         node: str,
     ) -> dict:
         """单步驱动适配器，供逐节点驱动图的调用方使用。"""
+        self._validate_step_context(envelope, node)
         if node == _PLAN:
             return self._planner(state, envelope)
         if node == _REVIEW:
             return self._review(state, envelope)
+        if node == _AGGREGATE:
+            previous = self._bound_envelope
+            self._bound_envelope = envelope
+            try:
+                return self._aggregate_node(state, {})
+            finally:
+                self._bound_envelope = previous
         raise AppError("RUN_STATE_CONFLICT", f"unknown graph node: {node}")
+
+    @staticmethod
+    def _validate_step_context(envelope: AgentInputEnvelope, node: str) -> None:
+        """校验单步调用的运行身份，阻断章节节点的跨流程旁路调用。"""
+        runtime = envelope.runtime_context
+        if runtime.run_scope != "chapter" or runtime.chapter_id is None:
+            raise AppError("COMMAND_CONTEXT_MISMATCH", f"{node} requires a chapter run")
+        if node == _PLAN and not (
+            envelope.request_type == "new_chapter" and runtime.decision_target == "plan"
+        ):
+            raise AppError(
+                "COMMAND_CONTEXT_MISMATCH",
+                "chapter planner requires a new chapter planning run",
+            )
+        if node == _REVIEW and not (
+            envelope.request_type == "review" and runtime.decision_target == "chapter"
+        ):
+            raise AppError(
+                "COMMAND_CONTEXT_MISMATCH",
+                "chapter review requires a chapter review run",
+            )
+        if node == _AGGREGATE and not (
+            envelope.request_type == "review" and runtime.decision_target == "chapter"
+        ):
+            raise AppError(
+                "COMMAND_CONTEXT_MISMATCH",
+                "chapter aggregation requires a chapter review run",
+            )

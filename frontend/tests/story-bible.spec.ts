@@ -114,9 +114,34 @@ async function startCanonExtract(page: Page): Promise<string> {
   const runResp = page.waitForResponse(
     (r) => r.request().method() === "POST" && r.url().includes("/canon-runs"),
   );
+  // 作用域切换会异步刷新 accepted source；先等待按钮真正可用，避免把
+  // 正常的状态刷新延迟误判成 Canon 创建失败。
+  await expect(page.getByTestId("btn-canon-start")).toBeEnabled();
   await page.getByTestId("btn-canon-start").click();
   const body = (await (await runResp).json()) as { run_id: string };
   return body.run_id;
+}
+
+/** 等待章节接受事件自动创建当前 accepted revision 的 Canon 运行。 */
+async function waitForCanonRun(
+  request: APIRequestContext,
+  targetType: "chapter" | "scene",
+  targetId: string,
+): Promise<string> {
+  const path = targetType === "chapter"
+    ? `/api/chapters/${targetId}/canon-candidates`
+    : `/api/scenes/${targetId}/canon-candidates`;
+  let runId = "";
+  await expect
+    .poll(async () => {
+      const response = await request.get(path);
+      if (!response.ok()) return "";
+      const body = (await response.json()) as { run_id?: string | null };
+      runId = body.run_id ?? "";
+      return runId;
+    }, { timeout: 30_000 })
+    .toMatch(/\S+/);
+  return runId;
 }
 
 test("Story Bible 展示正式 Canon 与三类候选（来源/作用域/状态）", async ({ page, request }) => {
@@ -140,6 +165,9 @@ test("Story Bible 展示正式 Canon 与三类候选（来源/作用域/状态�
 
   // 场景级提取候选（固定 fixture 播种，不接入真实模型 API）。
   const runId = await startCanonExtract(page);
+  // 候选尚未写入时，面板仍必须显示当前 queued/running Canon run，不能把状态清空。
+  await page.getByTestId("btn-canon-refresh").click();
+  await expect(page.getByTestId("canon-run-status")).toBeVisible();
   seedCanonCandidates(runId);
   await page.getByTestId("btn-canon-refresh").click();
 
@@ -201,7 +229,9 @@ test("章节级决策更新全局 Canon（confirm 物化，reject/defer 不物�
   await openScene(page, `${prefix}-P`, "场景");
   // 切换到章节级目标。
   await page.getByTestId("btn-canon-scope-chapter").click();
-  const runId = await startCanonExtract(page);
+  // 章节接受事件会由 Worker 自动创建 Canon run；这里不重复点击提取入口。
+  const runId = await waitForCanonRun(request, "chapter", chapterId);
+  await expect(page.getByTestId("btn-canon-start")).toBeDisabled();
   seedCanonCandidates(runId);
   await page.getByTestId("btn-canon-refresh").click();
 

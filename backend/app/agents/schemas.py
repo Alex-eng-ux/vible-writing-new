@@ -81,6 +81,13 @@ class AgentInputEnvelope(BaseModel):
     runtime_context: RuntimeContext
     volume: dict = Field(default_factory=dict)
     chapter_contract: dict = Field(default_factory=dict)
+    # 章节规划运行的最小输入。首次规划允许 chapter_contract 为空，Planner
+    # 应从自然语言意图与讨论上下文生成候选，而不是把空契约当作已确认计划。
+    chapter_intent: dict = Field(default_factory=dict)
+    plan_discussion: list[dict] = Field(default_factory=list)
+    pending_plan_questions: list[dict] = Field(default_factory=list)
+    pending_plan_proposals: list[dict] = Field(default_factory=list)
+    plan_decisions: list[dict] = Field(default_factory=list)
     scene_brief: dict = Field(default_factory=dict)
     request_type: Literal["new_chapter", "continue", "rewrite", "review"] = "continue"
     base_scene_revision_id: str | None = None
@@ -169,6 +176,11 @@ class ChapterPlanOutput(BaseModel):
     scene_contracts: list[dict] = Field(default_factory=list)
     reason: str = ""
     clarification_questions: list[str] = Field(default_factory=list)
+    # 规划候选的可追溯元数据；旧 Provider 响应不提供这些字段时保持兼容。
+    proposals: list[dict] = Field(default_factory=list)
+    unresolved_assumptions: list[str] = Field(default_factory=list)
+    contract_field_provenance: dict = Field(default_factory=dict)
+    scene_field_provenance: dict = Field(default_factory=dict)
 
 
 class ChapterReviewOutput(BaseModel):

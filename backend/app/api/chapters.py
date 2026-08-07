@@ -17,15 +17,10 @@ from ..db.models import (
     ChapterPlanRevision,
     ChapterPlanRevisionLink,
     ChapterRevision,
+    ChapterRevisionScene,
     Scene,
 )
-from ..domain.chapters import (
-    accept_chapter_plan_revision,
-    create_chapter_plan_revision,
-    create_scene,
-    materialize_chapter_plan,
-    rollback_chapter_revision,
-)
+from ..domain.chapters import chapter_workflow_read, create_scene, rollback_chapter_revision
 from ..domain.commit_guard import CommitGuard
 from ..domain.idempotency import fingerprint
 from ..domain.interfaces import CommandContext
@@ -39,6 +34,7 @@ from .schemas import (
     ChapterPlanRead,
     ChapterRead,
     ChapterRevisionRead,
+    ChapterWorkflowRead,
     ResourceCreated,
     RollbackRequest,
     SceneCreate,
@@ -46,6 +42,35 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/api/chapters", tags=["chapters"])
+
+
+def _chapter_revision_read(session: Session, revision: ChapterRevision) -> dict:
+    """构造包含固定场景映射、审校摘要和当前 accepted 指针的版本读模型。"""
+    chapter = session.get(Chapter, revision.chapter_id)
+    scene_versions = [
+        {
+            "scene_id": row.scene_id,
+            "scene_revision_id": row.scene_revision_id,
+            "sort_order": row.sort_order,
+        }
+        for row in session.execute(
+            select(ChapterRevisionScene)
+            .where(ChapterRevisionScene.chapter_revision_id == revision.id)
+            .order_by(ChapterRevisionScene.sort_order)
+        ).scalars()
+    ]
+    return {
+        "id": revision.id,
+        "parent_revision_id": revision.parent_revision_id,
+        "chapter_id": revision.chapter_id,
+        "status": revision.status,
+        "reason": revision.reason,
+        "created_at": revision.created_at.isoformat(),
+        "scene_versions": scene_versions,
+        "review_issues": revision.review_issues or [],
+        "review_summary": revision.review_summary or {},
+        "is_current_accepted": bool(chapter and chapter.accepted_chapter_revision_id == revision.id),
+    }
 
 
 @router.delete("/{chapter_id}", status_code=204)
@@ -198,108 +223,14 @@ def get_chapter_plan(
     )
 
 
-# 初始章节计划：把章节现有场景映射进计划（稳定 client_key -> scene_id），
-# 无场景时创建空计划。作者接受后（ChapterPlanRevisionLink），场景续写/改写/
-# 审校运行即可用。计划内容由 planner 生成仍属后续任务；本接口只做幂等的
-# 初始化，不绕过 Task 2 的计划事务。
-_INIT_PLAN_REASON = "init-plan"
-
-
-@router.post("/{chapter_id}/plan", response_model=ChapterPlanRead)
-def post_chapter_plan(
+@router.get("/{chapter_id}/workflow", response_model=ChapterWorkflowRead)
+def get_chapter_workflow(
     chapter_id: str,
-    idempotency_key: str = Depends(get_idempotency_key),
     session: Session = Depends(get_db),
-    actor_id: str = Depends(get_actor_id),
-) -> ChapterPlanRead:
-    """为章节创建并接受一个初始章节计划（幂等命令）。
+) -> ChapterWorkflowRead:
+    """返回章节工作台单一权威组合视图。"""
+    return ChapterWorkflowRead(**chapter_workflow_read(session, chapter_id))
 
-    已存在 accepted plan 时直接返回当前指针（幂等重放）；否则把章节现有场景
-    映射进计划（client_key=场景 id，scene_id 复用，不重复建场景）并接受，
-    使该章节下的场景运行（continue/rewrite/review）可用。
-    """
-    if session.get(Chapter, chapter_id) is None:
-        raise AppError("CONTEXT_SOURCE_UNAVAILABLE", "chapter not found")
-    link = session.execute(
-        select(ChapterPlanRevisionLink).where(
-            ChapterPlanRevisionLink.chapter_id == chapter_id
-        )
-    ).scalar_one_or_none()
-
-    def run(manual_command_id: str | None) -> tuple[dict, str | None]:
-        ctx: CommandContext = cast(
-            CommandContext,
-            {
-                "lease_context": None,
-                "write_fence": None,
-                "generation_run_id": None,
-                "agent_run_id": None,
-                "manual_command_id": manual_command_id,
-                "source": "author",
-                "parent_generation_run_id": None,
-                "supersedes_run_id": None,
-                "parent_plan_revision_id": None,
-                "actor_id": actor_id,
-                "preceding_chapter_id": None,
-                "preceding_accepted_chapter_revision_id": None,
-                "entry_handoff_id": None,
-                "entry_source_chapter_revision_id": None,
-                "entry_handoff_chain_hash": None,
-                "base_scene_revision_id": None,
-                "base_chapter_revision_id": None,
-                "accepted_scene_revision_id": None,
-                "accepted_chapter_revision_id": None,
-                "plan_revision_id": None,
-                "canon_scope": None,
-                "decision_target": None,
-                "context_source_refs": [],
-                "author_decision": None,
-                "idempotency_key": idempotency_key,
-                "expected_run_version": None,
-            },
-        )
-        if link is not None:
-            plan = session.get(ChapterPlanRevision, link.plan_revision_id)
-            return _plan_read(
-                chapter_id,
-                link.plan_revision_id,
-                plan.status if plan else None,
-                link.plan_version,
-                plan.chapter_contract if plan else None,
-                plan.reason if plan else None,
-            ), link.plan_revision_id
-        scenes = session.execute(
-            select(Scene).where(Scene.chapter_id == chapter_id).order_by(Scene.created_at)
-        ).scalars().all()
-        specs = [
-            {"scene_id": s.id, "client_key": s.id, "title": s.title, "scene_brief": s.scene_brief or {}}
-            for s in scenes
-        ]
-        plan = create_chapter_plan_revision(
-            session, chapter_id, None, {"scenes": specs, "outline": _INIT_PLAN_REASON}, _INIT_PLAN_REASON, ctx
-        )
-        accept_chapter_plan_revision(session, chapter_id, plan.id, cast(str, None), 1, ctx)
-        materialize_chapter_plan(session, chapter_id, plan.id, specs, ctx)
-        return _plan_read(
-            chapter_id,
-            plan.id,
-            plan.status,
-            plan.plan_version,
-            plan.chapter_contract,
-            plan.reason,
-        ), plan.id
-
-    request_fp = fingerprint({"chapter_id": chapter_id})
-    return ChapterPlanRead(
-        **execute_command(
-            session,
-            f"chapter:{chapter_id}",
-            "plan_init",
-            idempotency_key,
-            request_fp,
-            run,
-        )
-    )
 
 
 def _plan_read(
@@ -371,16 +302,22 @@ def list_chapter_revisions(
         .all()
     )
     return [
-        ChapterRevisionRead(
-            id=rev.id,
-            parent_revision_id=rev.parent_revision_id,
-            chapter_id=rev.chapter_id,
-            status=rev.status,
-            reason=rev.reason,
-            created_at=rev.created_at.isoformat(),
-        )
+        ChapterRevisionRead(**_chapter_revision_read(session, rev))
         for rev in rows
     ]
+
+
+@router.get("/{chapter_id}/revisions/{revision_id}", response_model=ChapterRevisionRead)
+def get_chapter_revision(
+    chapter_id: str,
+    revision_id: str,
+    session: Session = Depends(get_db),
+) -> ChapterRevisionRead:
+    """读取单个章节版本及其固定场景版本映射和审校结果。"""
+    revision = session.get(ChapterRevision, revision_id)
+    if revision is None or revision.chapter_id != chapter_id:
+        raise AppError("CONTEXT_SOURCE_UNAVAILABLE", "chapter revision not found")
+    return ChapterRevisionRead(**_chapter_revision_read(session, revision))
 
 
 @router.get("/{chapter_id}/handoff", response_model=ChapterHandoffRead | None)
@@ -434,14 +371,7 @@ def post_chapter_rollback(
                 },
             ),
         )
-        response = {
-            "id": rev.id,
-            "parent_revision_id": rev.parent_revision_id,
-            "chapter_id": rev.chapter_id,
-            "status": rev.status,
-            "reason": rev.reason,
-            "created_at": rev.created_at.isoformat(),
-        }
+        response = _chapter_revision_read(session, rev)
         return response, rev.id
 
     return ChapterRevisionRead(

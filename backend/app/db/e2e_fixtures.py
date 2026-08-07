@@ -38,11 +38,18 @@ from sqlalchemy.orm import Session
 from app.db.models import (
     CanonFact,
     Chapter,
+    ChapterPlanRevision,
+    ChapterRevision,
+    FactCandidate,
     GenerationRun,
+    PlotThreadUpdate,
     PlotThread,
+    RunEvent,
+    RunOutboxRecord,
     Scene,
     SceneDraftArtifact,
     SceneRevision,
+    TimelineEventCandidate,
     TimelineEvent,
 )
 from app.domain.chapters import (
@@ -50,6 +57,7 @@ from app.domain.chapters import (
     aggregate_chapter_revision,
     commit_chapter_version,
     create_chapter_plan_revision,
+    persist_chapter_plan_candidate,
 )
 from app.domain.interfaces import CommandContext
 from app.domain.manuscript import content_hash
@@ -104,19 +112,39 @@ def _db_url() -> str:
     )
 
 
-def seed_plan(session: Session, chapter_id: str) -> str:
-    """创建并接受章节 plan（固定 fixture：空场景契约）。
+def seed_plan(
+    session: Session,
+    chapter_id: str,
+    scene_id: str | None = None,
+) -> str:
+    """创建并接受章节 plan；可选映射已有场景。
 
-    返回：accepted plan revision id。
+    返回：accepted plan revision id。E2E Worker 是否自动消费该 plan 由 Worker
+    启动模式控制，fixture 本身不改变生产 outbox 语义。
     """
+    scene_briefs: list[dict[str, Any]] = []
+    if scene_id:
+        scene = session.get(Scene, scene_id)
+        if scene is None or scene.chapter_id != chapter_id:
+            raise SystemExit(f"scene not found in chapter: {scene_id}")
+        scene_briefs.append(
+            {
+                "client_key": "e2e-scene",
+                "scene_id": scene.id,
+                "title": scene.title,
+                "scene_brief": scene.scene_brief or {},
+            }
+        )
     plan = create_chapter_plan_revision(
         session,
         chapter_id,
         None,
-        {"scenes": [], "outline": "e2e fixture outline"},
+        {"scenes": scene_briefs, "outline": "e2e fixture outline"},
         "e2e fixture",
         _FIXTURE_CTX,
     )
+    if scene_briefs:
+        plan.scene_briefs = scene_briefs
     accept_chapter_plan_revision(
         session,
         chapter_id,
@@ -126,6 +154,63 @@ def seed_plan(session: Session, chapter_id: str) -> str:
         1,
         _FIXTURE_CTX,
     )
+    session.commit()
+    return plan.id
+
+
+def seed_plan_candidate(session: Session, run_id: str) -> str:
+    """为章节规划运行幂等播种待接受候选并推进到等待作者决策。"""
+    run = session.execute(
+        select(GenerationRun).where(GenerationRun.id == run_id).with_for_update()
+    ).scalar_one_or_none()
+    if run is None or run.chapter_id is None or run.decision_target != "plan":
+        raise SystemExit(f"plan run not found: {run_id}")
+    plan = session.execute(
+        select(ChapterPlanRevision)
+        .where(ChapterPlanRevision.source_run_id == run_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if plan is None:
+        scene_briefs = [
+            {
+                "client_key": "journey-scene-1",
+                "title": "第一场",
+                "scene_brief": {"goal": "在观星台确认线索"},
+            },
+            {
+                "client_key": "journey-scene-2",
+                "title": "第二场",
+                "scene_brief": {"goal": "作出不可逆选择"},
+            },
+        ]
+        ctx = cast(CommandContext, {**_FIXTURE_CTX, "generation_run_id": run_id})
+        plan = persist_chapter_plan_candidate(
+            session,
+            run.chapter_id,
+            source_run_id=run_id,
+            planning_lineage_id=run.id,
+            chapter_contract={"outline": "确定性章节计划", "scenes": scene_briefs},
+            scene_briefs=scene_briefs,
+            reason="e2e fixture",
+            ctx=ctx,
+        )
+    event_exists = session.execute(
+        select(RunEvent.event_id)
+        .where(RunEvent.generation_run_id == run_id, RunEvent.event_type == "run_waiting_feedback")
+        .limit(1)
+    ).scalar_one_or_none()
+    if event_exists is None:
+        run.status = "waiting_feedback"
+        run.pending_node = "chapter_planner"
+        run.write_fencing_token += 1
+        session.flush()
+        PostgresRunEventStore(session).emit(
+            run_id,
+            "run_waiting_feedback",
+            {"issues": [], "candidate_revision_id": plan.id},
+            fencing_token=run.write_fencing_token,
+            producer_command_id="e2e-fixture",
+        )
     session.commit()
     return plan.id
 
@@ -255,25 +340,43 @@ def seed_canon_candidates(session: Session, run_id: str) -> str:
                 "source_revision_id": source_rev,
             }
         )
-    # upsert_canon_candidates 要求 ctx.generation_run_id == run_id（身份互斥校验）。
-    ctx = cast(CommandContext, {**_FIXTURE_CTX, "generation_run_id": run_id})
-    rows = upsert_canon_candidates(session, run_id, candidates, ctx)
-    # 推进到 waiting_feedback（模拟 Worker 写 fence，事件用同一令牌写入）。
-    run.status = "waiting_feedback"
-    run.pending_node = "canon_extract"
-    run.write_fencing_token += 1
-    token = run.write_fencing_token
-    session.flush()
-    store = PostgresRunEventStore(session)
-    store.emit(
-        run_id,
-        "run_waiting_feedback",
-        {"issues": [], "candidate_count": len(rows)},
-        fencing_token=token,
-        producer_command_id="e2e-fixture",
-    )
+    existing_rows = []
+    for model in (FactCandidate, TimelineEventCandidate, PlotThreadUpdate):
+        existing_rows.extend(
+            session.execute(
+                select(model).where(model.generation_run_id == run_id)
+            ).scalars().all()
+        )
+    if existing_rows:
+        candidate_id = existing_rows[0].id
+        candidate_count = len(existing_rows)
+    else:
+        # upsert_canon_candidates 要求 ctx.generation_run_id == run_id（身份互斥校验）。
+        ctx = cast(CommandContext, {**_FIXTURE_CTX, "generation_run_id": run_id})
+        rows = upsert_canon_candidates(session, run_id, candidates, ctx)
+        candidate_id = rows[0]["id"] if rows else ""
+        candidate_count = len(rows)
+    event_exists = session.execute(
+        select(RunEvent.event_id)
+        .where(RunEvent.generation_run_id == run_id, RunEvent.event_type == "run_waiting_feedback")
+        .limit(1)
+    ).scalar_one_or_none()
+    if event_exists is None:
+        # 仅首次推进时递增 fencing 并追加事件；重复 fixture 调用保持事件序列稳定。
+        run.status = "waiting_feedback"
+        run.pending_node = "canon_extract"
+        run.write_fencing_token += 1
+        token = run.write_fencing_token
+        session.flush()
+        PostgresRunEventStore(session).emit(
+            run_id,
+            "run_waiting_feedback",
+            {"issues": [], "candidate_count": candidate_count},
+            fencing_token=token,
+            producer_command_id="e2e-fixture",
+        )
     session.commit()
-    return rows[0]["id"] if rows else ""
+    return candidate_id
 
 
 def seed_canon_entries(session: Session, project_id: str, chapter_id: str | None = None) -> None:
@@ -396,6 +499,113 @@ def advance_run(
     session.commit()
 
 
+def seed_chapter_review(session: Session, run_id: str) -> str:
+    """为章节审校运行幂等创建 staged revision 并推进等待反馈。"""
+    run = session.execute(
+        select(GenerationRun).where(GenerationRun.id == run_id).with_for_update()
+    ).scalar_one_or_none()
+    if run is None or run.chapter_id is None or run.decision_target != "chapter":
+        raise SystemExit(f"chapter review run not found: {run_id}")
+    revision = session.execute(
+        select(ChapterRevision)
+        .where(ChapterRevision.review_run_id == run_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if revision is None:
+        ctx = cast(CommandContext, {**_FIXTURE_CTX, "generation_run_id": run_id})
+        revision = aggregate_chapter_revision(
+            session,
+            run.chapter_id,
+            [],
+            "e2e fixture chapter review",
+            ctx,
+        )
+        revision.review_issues = [
+            {
+                "local_key": "chapter-structure",
+                "severity": "medium",
+                "dimension": "structure",
+                "message": "结构节奏需要确认",
+            }
+        ]
+        revision.review_summary = {
+            "status": "needs_review",
+            "overall_rating": "B",
+            "submitted": True,
+        }
+        revision.review_run_id = run_id
+        chapter = session.get(Chapter, run.chapter_id)
+        if chapter is not None:
+            # 章节审校 fixture 模拟入口链已同步，允许随后按 accepted
+            # ChapterRevision 启动章节级 Canon；不改变生产 handoff 语义。
+            chapter.entry_handoff_status = "in_sync"
+    event_exists = session.execute(
+        select(RunEvent.event_id)
+        .where(RunEvent.generation_run_id == run_id, RunEvent.event_type == "run_waiting_feedback")
+        .limit(1)
+    ).scalar_one_or_none()
+    if event_exists is None:
+        run.status = "waiting_feedback"
+        run.pending_node = "chapter_review"
+        run.write_fencing_token += 1
+        session.flush()
+        PostgresRunEventStore(session).emit(
+            run_id,
+            "run_waiting_feedback",
+            {"issues": revision.review_issues, "chapter_revision_id": revision.id},
+            fencing_token=run.write_fencing_token,
+            producer_command_id="e2e-fixture",
+        )
+    session.commit()
+    return revision.id
+
+
+def diagnose_chapter(session: Session, chapter_id: str) -> dict[str, Any]:
+    """输出失败诊断：阶段、运行、待决策、最后事件与未消费 outbox。"""
+    from app.domain.chapters import chapter_workflow_read
+
+    snapshot = chapter_workflow_read(session, chapter_id)
+    active = snapshot.get("active_run") or {}
+    run_id = active.get("run_id")
+    last_event_sequence = 0
+    if run_id:
+        last_event_sequence = session.execute(
+            select(RunEvent.sequence)
+            .where(RunEvent.generation_run_id == run_id)
+            .order_by(RunEvent.sequence.desc())
+            .limit(1)
+        ).scalar_one_or_none() or 0
+    unconsumed_states = ("pending", "publishing", "published", "failed")
+    outbox_query = select(RunOutboxRecord).where(
+        RunOutboxRecord.delivery_status.in_(unconsumed_states)
+    )
+    # 没有活动 run 时只看章节资源 outbox，避免 generation_run_id IS NULL
+    # 把其他命令的全局消息误报为本章节诊断结果。
+    if run_id:
+        outbox_query = outbox_query.where(
+            (RunOutboxRecord.generation_run_id == run_id)
+            | (RunOutboxRecord.resource_id == chapter_id)
+        )
+    else:
+        outbox_query = outbox_query.where(RunOutboxRecord.resource_id == chapter_id)
+    pending_outbox = session.execute(outbox_query.order_by(RunOutboxRecord.created_at)).scalars().all()
+    return {
+        "phase": snapshot.get("phase"),
+        "run_id": run_id,
+        "pending_decision": snapshot.get("pending_decision"),
+        "last_event_sequence": last_event_sequence,
+        "unconsumed_outbox": [
+            {
+                "outbox_id": row.outbox_id,
+                "resource_type": row.resource_type,
+                "resource_id": row.resource_id,
+                "delivery_status": row.delivery_status,
+            }
+            for row in pending_outbox
+        ],
+    }
+
+
 def _parse_json(arg: str | None) -> Any:
     if not arg:
         return None
@@ -410,6 +620,7 @@ def main(argv: list[str] | None = None) -> None:
 
     p1 = sub.add_parser("seed-plan")
     p1.add_argument("--chapter-id", required=True)
+    p1.add_argument("--scene-id", default=None)
 
     p2 = sub.add_parser("seed-scene-accepted")
     p2.add_argument("--scene-id", required=True)
@@ -417,6 +628,15 @@ def main(argv: list[str] | None = None) -> None:
 
     p2b = sub.add_parser("seed-chapter-accepted")
     p2b.add_argument("--chapter-id", required=True)
+
+    p2a = sub.add_parser("seed-plan-candidate")
+    p2a.add_argument("--run-id", required=True)
+
+    p2e = sub.add_parser("seed-chapter-review")
+    p2e.add_argument("--run-id", required=True)
+
+    pdiag = sub.add_parser("diagnose")
+    pdiag.add_argument("--chapter-id", required=True)
 
     p2c = sub.add_parser("seed-canon-candidates")
     p2c.add_argument("--run-id", required=True)
@@ -441,14 +661,20 @@ def main(argv: list[str] | None = None) -> None:
     engine = create_engine(url)
     with Session(engine) as session:
         if args.command == "seed-plan":
-            plan_id = seed_plan(session, args.chapter_id)
+            plan_id = seed_plan(session, args.chapter_id, args.scene_id)
             print(plan_id)
+        elif args.command == "seed-plan-candidate":
+            print(seed_plan_candidate(session, args.run_id))
         elif args.command == "seed-scene-accepted":
             rev_id = seed_scene_accepted(session, args.scene_id, args.text)
             print(rev_id)
         elif args.command == "seed-chapter-accepted":
             rev_id = seed_chapter_accepted(session, args.chapter_id)
             print(rev_id)
+        elif args.command == "seed-chapter-review":
+            print(seed_chapter_review(session, args.run_id))
+        elif args.command == "diagnose":
+            print(json.dumps(diagnose_chapter(session, args.chapter_id), ensure_ascii=False))
         elif args.command == "seed-canon-candidates":
             candidate_id = seed_canon_candidates(session, args.run_id)
             print(candidate_id)
